@@ -245,6 +245,20 @@ async def upsert_zone(request: Request) -> JSONResponse:
                 {"error": "upstream error", "status": r.status_code, "detail": r.text},
                 status_code=502,
             )
+        # Broadcast to all connected socket clients so every device updates instantly
+        await sio.emit("zone_upserted", {
+            "id":         zone_id,
+            "device_id":  device_id,
+            "name":       payload["name"],
+            "channel":    channel,
+            "lat":        lat,
+            "lng":        lng,
+            "radius":     radius,
+            "color":      color,
+            "auto_join":  auto_join,
+            "created_by": payload.get("created_by", ""),
+        })
+        log.info("zone_upserted broadcast id=%s by device=%s", zone_id, device_id[:12])
         return JSONResponse({"ok": True})
     except Exception as e:
         log.exception("upsert_zone error: %s", e)
@@ -278,6 +292,9 @@ async def delete_zone(zone_id: str, request: Request) -> JSONResponse:
                 {"error": "upstream error", "status": r.status_code, "detail": r.text},
                 status_code=502,
             )
+        # Broadcast deletion to all connected clients
+        await sio.emit("zone_deleted", {"id": zone_id, "device_id": device_id})
+        log.info("zone_deleted broadcast id=%s by device=%s", zone_id, device_id[:12])
         return JSONResponse({"ok": True})
     except Exception as e:
         log.exception("delete_zone error: %s", e)

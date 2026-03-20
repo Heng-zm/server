@@ -574,9 +574,10 @@ async def join_room(sid: str, data: dict) -> None:
 
         await sio.enter_room(sid, room)
 
-        # FIX 17: already concurrent — fire both at once
-        members = await (_redis_room_members(room) if _redis else
-                         asyncio.coroutine(lambda: _local_room_members(room))())
+        # FIX 17: _redis_room_members is an async function and handles the local fallback internally 
+        # when _redis is None. No need for asyncio.coroutine.
+        members = await _redis_room_members(room)
+        
         await asyncio.gather(
             sio.emit("peer_joined", {"sid": sid, "name": name}, room=room, skip_sid=sid),
             sio.emit("room_state",  {"members": members}, to=sid),
@@ -585,7 +586,6 @@ async def join_room(sid: str, data: dict) -> None:
 
     except Exception as exc:
         log.exception("join_room sid=%s: %s", sid, exc)
-
 
 @sio.event
 async def leave_room_event(sid: str, data: dict) -> None:

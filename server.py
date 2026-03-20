@@ -143,6 +143,8 @@ async def get_zones(request: Request) -> JSONResponse:
     if not device_id:
         return JSONResponse({"error": "device_id required"}, status_code=400)
 
+    if _http is None:
+        return JSONResponse({"error": "server initializing"}, status_code=503)
     try:
         r = await _http.get(
             "/rest/v1/geo_zones",
@@ -155,8 +157,8 @@ async def get_zones(request: Request) -> JSONResponse:
         r.raise_for_status()
         return JSONResponse(r.json())
     except httpx.HTTPStatusError as e:
-        log.error("Supabase GET zones failed: %s", e)
-        return JSONResponse({"error": "upstream error"}, status_code=502)
+        log.error("Supabase GET zones failed: %s  body=%s", e, e.response.text if hasattr(e, "response") else "")
+        return JSONResponse({"error": "upstream error", "detail": str(e)}, status_code=502)
     except Exception as e:
         log.exception("get_zones error: %s", e)
         return JSONResponse({"error": "server error"}, status_code=500)
@@ -207,6 +209,8 @@ async def upsert_zone(request: Request) -> JSONResponse:
         "auto_join": auto_join,
     }
 
+    if _http is None:
+        return JSONResponse({"error": "server initializing"}, status_code=503)
     try:
         r = await _http.post(
             "/rest/v1/geo_zones",
@@ -216,8 +220,8 @@ async def upsert_zone(request: Request) -> JSONResponse:
         r.raise_for_status()
         return JSONResponse({"ok": True})
     except httpx.HTTPStatusError as e:
-        log.error("Supabase upsert zone failed: %s  body=%s", e, e.response.text)
-        return JSONResponse({"error": "upstream error"}, status_code=502)
+        log.error("Supabase upsert zone failed: %s  body=%s", e, e.response.text if hasattr(e, "response") else "")
+        return JSONResponse({"error": "upstream error", "detail": e.response.text if hasattr(e, "response") else str(e)}, status_code=502)
     except Exception as e:
         log.exception("upsert_zone error: %s", e)
         return JSONResponse({"error": "server error"}, status_code=500)
@@ -234,6 +238,8 @@ async def delete_zone(zone_id: str, request: Request) -> JSONResponse:
     if not device_id or not zone_id:
         return JSONResponse({"error": "device_id and zone_id required"}, status_code=400)
 
+    if _http is None:
+        return JSONResponse({"error": "server initializing"}, status_code=503)
     try:
         r = await _http.delete(
             "/rest/v1/geo_zones",

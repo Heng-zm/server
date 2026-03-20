@@ -9,6 +9,7 @@ sio = socketio.AsyncServer(
     cors_allowed_origins='*',
     ping_timeout=60,
     ping_interval=25,
+    max_http_buffer_size=10 * 1024 * 1024,  # 10 MB — allows large audio blobs
 )
 
 socket_app = socketio.ASGIApp(sio, app)
@@ -20,7 +21,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Track which room each user is in
 user_rooms = {}
 
 
@@ -32,8 +32,6 @@ async def connect(sid, environ):
 @sio.event
 async def disconnect(sid):
     print(f"[-] Disconnected: {sid}")
-
-    # Notify the peer in the same room that this user left
     room_id = user_rooms.get(sid)
     if room_id:
         await sio.emit('peer-left', sid, room=room_id, skip_sid=sid)
@@ -44,7 +42,6 @@ async def disconnect(sid):
 
 @sio.event
 async def join_room(sid, room_id):
-    # Leave any previous room first
     old_room = user_rooms.get(sid)
     if old_room and old_room != room_id:
         await sio.emit('peer-left', sid, room=old_room, skip_sid=sid)
@@ -53,15 +50,25 @@ async def join_room(sid, room_id):
 
     await sio.enter_room(sid, room_id)
     user_rooms[sid] = room_id
-
-    # Tell everyone else in the room that a peer joined
     await sio.emit('peer-joined', sid, room=room_id, skip_sid=sid)
     print(f"    {sid} joined room: {room_id}")
 
 
 @sio.event
-async def signal(sid, data):
-    to = data.get('to')
-    payload = data.get('data')
-    if to and payload is not None:
-        await sio.emit('signal', {'from': sid, 'data': payload}, to=to)
+async def voice_message(sid, data):
+    """
+    Relay a recorded voice message to the target peer.
+    data = { to: sid, audio: base64string, mime: str, duration: float }
+    """
+    to      = data.get('to')
+    audio   = data.get('audio')
+    mime    = data.get('mime', 'audio/webm')
+    duration= data.get('duration', 0)
+
+    if to and audio:
+        await sio.emit('voice-message', {
+            'audio':    audio,
+            'mime':     mime,
+            'duration': duration,
+        }, to=to)
+        print(f"    Voice msg: {sid} -> {to} ({duration:.1f}s)")

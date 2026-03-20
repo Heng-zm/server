@@ -129,7 +129,28 @@ async def health() -> JSONResponse:
         "connections": len(users),
         "rooms":       {k: len(v) for k, v in rooms.items()},
         "uptime_s":    round(time.time() - _start_time),
+        "supabase_url": SUPABASE_URL,
+        "http_ready":   _http is not None,
     })
+
+
+@app.get("/zones/ping")
+async def zones_ping() -> JSONResponse:
+    """Diagnostic: verify Supabase table exists and key is valid."""
+    if _http is None:
+        return JSONResponse({"ok": False, "error": "http client not ready"}, status_code=503)
+    try:
+        r = await _http.get(
+            "/rest/v1/geo_zones",
+            params={"limit": "1", "select": "id"},
+        )
+        return JSONResponse({
+            "ok":     r.is_success,
+            "status": r.status_code,
+            "body":   r.text[:500],
+        })
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
 # ── Supabase proxy: GET /zones?device_id=<id> ────────────────────────────────
@@ -154,14 +175,16 @@ async def get_zones(request: Request) -> JSONResponse:
                 "select":    "id,name,channel,lat,lng,radius,color,auto_join",
             },
         )
-        r.raise_for_status()
+        if not r.is_success:
+            log.error("Supabase GET failed status=%s body=%s", r.status_code, r.text)
+            return JSONResponse(
+                {"error": "upstream error", "status": r.status_code, "detail": r.text},
+                status_code=502,
+            )
         return JSONResponse(r.json())
-    except httpx.HTTPStatusError as e:
-        log.error("Supabase GET zones failed: %s  body=%s", e, e.response.text if hasattr(e, "response") else "")
-        return JSONResponse({"error": "upstream error", "detail": str(e)}, status_code=502)
     except Exception as e:
         log.exception("get_zones error: %s", e)
-        return JSONResponse({"error": "server error"}, status_code=500)
+        return JSONResponse({"error": "server error", "detail": str(e)}, status_code=500)
 
 
 # ── Supabase proxy: POST /zones ───────────────────────────────────────────────
@@ -211,20 +234,23 @@ async def upsert_zone(request: Request) -> JSONResponse:
 
     if _http is None:
         return JSONResponse({"error": "server initializing"}, status_code=503)
+    log.info("upsert_zone payload: %s", payload)
     try:
         r = await _http.post(
             "/rest/v1/geo_zones",
             json=payload,
             headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
         )
-        r.raise_for_status()
+        if not r.is_success:
+            log.error("Supabase upsert failed status=%s body=%s", r.status_code, r.text)
+            return JSONResponse(
+                {"error": "upstream error", "status": r.status_code, "detail": r.text},
+                status_code=502,
+            )
         return JSONResponse({"ok": True})
-    except httpx.HTTPStatusError as e:
-        log.error("Supabase upsert zone failed: %s  body=%s", e, e.response.text if hasattr(e, "response") else "")
-        return JSONResponse({"error": "upstream error", "detail": e.response.text if hasattr(e, "response") else str(e)}, status_code=502)
     except Exception as e:
         log.exception("upsert_zone error: %s", e)
-        return JSONResponse({"error": "server error"}, status_code=500)
+        return JSONResponse({"error": "server error", "detail": str(e)}, status_code=500)
 
 
 # ── Supabase proxy: DELETE /zones/<id>?device_id=<device_id> ─────────────────
@@ -248,14 +274,16 @@ async def delete_zone(zone_id: str, request: Request) -> JSONResponse:
                 "device_id": f"eq.{device_id}",
             },
         )
-        r.raise_for_status()
+        if not r.is_success:
+            log.error("Supabase DELETE failed status=%s body=%s", r.status_code, r.text)
+            return JSONResponse(
+                {"error": "upstream error", "status": r.status_code, "detail": r.text},
+                status_code=502,
+            )
         return JSONResponse({"ok": True})
-    except httpx.HTTPStatusError as e:
-        log.error("Supabase delete zone failed: %s", e)
-        return JSONResponse({"error": "upstream error"}, status_code=502)
     except Exception as e:
         log.exception("delete_zone error: %s", e)
-        return JSONResponse({"error": "server error"}, status_code=500)
+        return JSONResponse({"error": "server error", "detail": str(e)}, status_code=500)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

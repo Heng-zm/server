@@ -9,7 +9,7 @@ sio = socketio.AsyncServer(
     cors_allowed_origins='*',
     ping_timeout=60,
     ping_interval=25,
-    max_http_buffer_size=10 * 1024 * 1024,  # 10 MB — allows large audio blobs
+    max_http_buffer_size=10 * 1024 * 1024,  # 10 MB for audio blobs
 )
 
 socket_app = socketio.ASGIApp(sio, app)
@@ -21,6 +21,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# sid -> room_id
 user_rooms = {}
 
 
@@ -42,6 +43,7 @@ async def disconnect(sid):
 
 @sio.event
 async def join_room(sid, room_id):
+    # Leave previous room if switching
     old_room = user_rooms.get(sid)
     if old_room and old_room != room_id:
         await sio.emit('peer-left', sid, room=old_room, skip_sid=sid)
@@ -57,18 +59,21 @@ async def join_room(sid, room_id):
 @sio.event
 async def voice_message(sid, data):
     """
-    Relay a recorded voice message to the target peer.
-    data = { to: sid, audio: base64string, mime: str, duration: float }
+    Relay recorded voice message to target peer.
+    data = { to, audio (base64), mime, duration }
     """
-    to      = data.get('to')
-    audio   = data.get('audio')
-    mime    = data.get('mime', 'audio/webm')
-    duration= data.get('duration', 0)
+    to       = data.get('to')
+    audio    = data.get('audio')
+    mime     = data.get('mime', 'audio/webm')
+    duration = data.get('duration', 0)
 
-    if to and audio:
-        await sio.emit('voice-message', {
-            'audio':    audio,
-            'mime':     mime,
-            'duration': duration,
-        }, to=to)
-        print(f"    Voice msg: {sid} -> {to} ({duration:.1f}s)")
+    if not to or not audio:
+        print(f"    [!] voice_message missing fields from {sid}")
+        return
+
+    await sio.emit('voice_message', {
+        'audio':    audio,
+        'mime':     mime,
+        'duration': duration,
+    }, to=to)
+    print(f"    Voice msg: {sid} -> {to} ({duration:.1f}s, {mime})")

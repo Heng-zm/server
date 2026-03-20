@@ -123,8 +123,13 @@ async def _lifespan(app: FastAPI):
     # Redis client (optional)
     if REDIS_URL:
         try:
-            import aioredis
-            _redis = await aioredis.from_url(
+            # redis-py ≥4.2 ships redis.asyncio; standalone aioredis is deprecated.
+            # Try redis.asyncio first, fall back to aioredis for older envs.
+            try:
+                from redis import asyncio as _aioredis
+            except ImportError:
+                import aioredis as _aioredis          # type: ignore[no-redef]
+            _redis = await _aioredis.from_url(
                 REDIS_URL,
                 encoding="utf-8",
                 decode_responses=True,

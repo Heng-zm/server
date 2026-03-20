@@ -157,22 +157,17 @@ async def zones_ping() -> JSONResponse:
 @app.get("/zones")
 async def get_zones(request: Request) -> JSONResponse:
     """
-    Proxy GET to Supabase geo_zones filtered by device_id.
-    Keeps SUPABASE_KEY server-side — client never needs it.
+    Return ALL zones from Supabase — visible to every device.
+    device_id is included so the client knows which zones it owns.
     """
-    device_id = _sanitize_device(request.query_params.get("device_id", ""))
-    if not device_id:
-        return JSONResponse({"error": "device_id required"}, status_code=400)
-
     if _http is None:
         return JSONResponse({"error": "server initializing"}, status_code=503)
     try:
         r = await _http.get(
             "/rest/v1/geo_zones",
             params={
-                "device_id": f"eq.{device_id}",
-                "order":     "created_at.asc",
-                "select":    "id,name,channel,lat,lng,radius,color,auto_join",
+                "order":  "created_at.asc",
+                "select": "id,device_id,name,channel,lat,lng,radius,color,auto_join,created_by",
             },
         )
         if not r.is_success:
@@ -220,16 +215,19 @@ async def upsert_zone(request: Request) -> JSONResponse:
     if not (10 <= radius <= 50_000):
         return JSONResponse({"error": "radius must be 10–50000 m"}, status_code=400)
 
+    created_by = _sanitize_name(str(body.get("created_by", "")), "")
+
     payload = {
-        "id":        zone_id,
-        "device_id": device_id,
-        "name":      name or channel,
-        "channel":   channel,
-        "lat":       lat,
-        "lng":       lng,
-        "radius":    radius,
-        "color":     color,
-        "auto_join": auto_join,
+        "id":         zone_id,
+        "device_id":  device_id,
+        "name":       name or channel,
+        "channel":    channel,
+        "lat":        lat,
+        "lng":        lng,
+        "radius":     radius,
+        "color":      color,
+        "auto_join":  auto_join,
+        "created_by": created_by[:32],
     }
 
     if _http is None:

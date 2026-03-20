@@ -2,8 +2,12 @@
 WalkieTalk — signaling + voice relay server
 FastAPI + python-socketio (ASGI)
 
+Environment variables (set in Render / Railway / .env):
+    SUPABASE_URL   = https://bgqeqiyfgpdvgeepignt.supabase.co
+    SUPABASE_KEY   = sb_publishable_eLoAp9t0x-t7id3a-3LUow_SaBM6EC6
+
 Run locally:
-    uvicorn server:socket_app --host 0.0.0.0 --port 3000 --reload
+    SUPABASE_URL=... SUPABASE_KEY=... uvicorn server:socket_app --host 0.0.0.0 --port 3000 --reload
 
 Deploy on Render / Railway:
     Start command: uvicorn server:socket_app --host 0.0.0.0 --port $PORT
@@ -11,12 +15,15 @@ Deploy on Render / Railway:
 
 import asyncio
 import logging
+import os
 import re
 import time
 from collections import deque
+from contextlib import asynccontextmanager
 
+import httpx
 import socketio
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -28,14 +35,29 @@ logging.basicConfig(
 )
 log = logging.getLogger("walkie")
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# ── Supabase config — read from environment, never hardcoded ─────────────────
+SUPABASE_URL = os.environ.get(
+    "SUPABASE_URL",
+    "https://bgqeqiyfgpdvgeepignt.supabase.co",   # fallback for local dev only
+)
+SUPABASE_KEY = os.environ.get(
+    "SUPABASE_KEY",
+    "sb_publishable_eLoAp9t0x-t7id3a-3LUow_SaBM6EC6",
+)
+_SB_HEADERS = {
+    "apikey":        SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type":  "application/json",
+}
+
+# ── Signal/Relay constants ────────────────────────────────────────────────────
 MAX_ROOM_SIZE   = 20
 MAX_NAME_LEN    = 32
 MAX_ROOM_LEN    = 40
-MAX_AUDIO_BYTES = 8_000_000      # 8 MB base64 (~6 MB audio)
-MAX_DURATION    = 65.0           # seconds — just above client 60s limit
-MAX_MSG_RATE    = 4              # voice messages allowed per window
-MSG_RATE_WINDOW = 10.0           # sliding window in seconds
+MAX_AUDIO_BYTES = 8_000_000
+MAX_DURATION    = 65.0
+MAX_MSG_RATE    = 4
+MSG_RATE_WINDOW = 10.0
 
 ALLOWED_MIME: frozenset[str] = frozenset({
     "audio/webm",
@@ -45,19 +67,40 @@ ALLOWED_MIME: frozenset[str] = frozenset({
     "audio/wav",
 })
 
-# Compiled once at import — never recreated per-call
-_NAME_RE = re.compile(r"[^a-z0-9_\-]")
-_ROOM_RE = re.compile(r"[^A-Z0-9_\-]")
-
+_NAME_RE    = re.compile(r"[^a-z0-9_\-]")
+_ROOM_RE    = re.compile(r"[^A-Z0-9_\-]")
+_DEVICE_RE  = re.compile(r"[^a-zA-Z0-9_\-]")   # device_id sanitizer
 _start_time = time.time()
 
-# ── App & socket setup ────────────────────────────────────────────────────────
-app = FastAPI(title="WalkieTalk", docs_url=None, redoc_url=None)
+# ── Shared async HTTP client for Supabase calls ───────────────────────────────
+_http: httpx.AsyncClient | None = None
+
+
+# ── Lifespan (replaces deprecated @app.on_event) ─────────────────────────────
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    global _http
+    _http = httpx.AsyncClient(
+        base_url=SUPABASE_URL,
+        headers=_SB_HEADERS,
+        timeout=10.0,
+    )
+    log.info(
+        "WalkieTalk started  pid=%d  supabase=%s",
+        os.getpid(), SUPABASE_URL,
+    )
+    yield
+    await _http.aclose()
+    log.info("WalkieTalk stopping  connections=%d", len(users))
+
+
+# ── App & socket ──────────────────────────────────────────────────────────────
+app = FastAPI(title="WalkieTalk", docs_url=None, redoc_url=None, lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["*"],       # Socket.IO transports need full method set
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
@@ -73,23 +116,12 @@ sio = socketio.AsyncServer(
 
 socket_app = socketio.ASGIApp(sio, app)
 
-# ── In-memory state ───────────────────────────────────────────────────────────
-# sid -> { room: str|None, name: str, joined_at: float, msg_times: deque[float] }
+# ── In-memory socket state ────────────────────────────────────────────────────
 users: dict[str, dict] = {}
-
-# room_id -> set of sids  (plain dict avoids phantom keys from defaultdict)
 rooms: dict[str, set]  = {}
 
-# ── Lifecycle ─────────────────────────────────────────────────────────────────
-@app.on_event("startup")
-async def _startup() -> None:
-    log.info("WalkieTalk server started  (pid=%d)", __import__("os").getpid())
 
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    log.info("WalkieTalk server stopping  (connections=%d)", len(users))
-
-# ── Health endpoint ───────────────────────────────────────────────────────────
+# ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health() -> JSONResponse:
     return JSONResponse({
@@ -99,23 +131,150 @@ async def health() -> JSONResponse:
         "uptime_s":    round(time.time() - _start_time),
     })
 
+
+# ── Supabase proxy: GET /zones?device_id=<id> ────────────────────────────────
+@app.get("/zones")
+async def get_zones(request: Request) -> JSONResponse:
+    """
+    Proxy GET to Supabase geo_zones filtered by device_id.
+    Keeps SUPABASE_KEY server-side — client never needs it.
+    """
+    device_id = _sanitize_device(request.query_params.get("device_id", ""))
+    if not device_id:
+        return JSONResponse({"error": "device_id required"}, status_code=400)
+
+    try:
+        r = await _http.get(
+            "/rest/v1/geo_zones",
+            params={
+                "device_id": f"eq.{device_id}",
+                "order":     "created_at.asc",
+                "select":    "id,name,channel,lat,lng,radius,color,auto_join",
+            },
+        )
+        r.raise_for_status()
+        return JSONResponse(r.json())
+    except httpx.HTTPStatusError as e:
+        log.error("Supabase GET zones failed: %s", e)
+        return JSONResponse({"error": "upstream error"}, status_code=502)
+    except Exception as e:
+        log.exception("get_zones error: %s", e)
+        return JSONResponse({"error": "server error"}, status_code=500)
+
+
+# ── Supabase proxy: POST /zones ───────────────────────────────────────────────
+@app.post("/zones")
+async def upsert_zone(request: Request) -> JSONResponse:
+    """
+    Proxy upsert to Supabase geo_zones.
+    Validates and sanitizes all fields server-side.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+    device_id = _sanitize_device(body.get("device_id", ""))
+    zone_id   = _sanitize_device(body.get("id", ""))
+    name      = str(body.get("name", ""))[:40].strip()
+    channel   = _sanitize_room(str(body.get("channel", "")))
+    color     = _validate_color(body.get("color", "#007aff"))
+    auto_join = bool(body.get("auto_join", True))
+
+    try:
+        lat    = float(body["lat"])
+        lng    = float(body["lng"])
+        radius = int(body["radius"])
+    except (KeyError, TypeError, ValueError):
+        return JSONResponse({"error": "lat/lng/radius required and must be numeric"}, status_code=400)
+
+    if not device_id or not zone_id or not channel:
+        return JSONResponse({"error": "device_id, id, channel required"}, status_code=400)
+    if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
+        return JSONResponse({"error": "invalid coordinates"}, status_code=400)
+    if not (10 <= radius <= 50_000):
+        return JSONResponse({"error": "radius must be 10–50000 m"}, status_code=400)
+
+    payload = {
+        "id":        zone_id,
+        "device_id": device_id,
+        "name":      name or channel,
+        "channel":   channel,
+        "lat":       lat,
+        "lng":       lng,
+        "radius":    radius,
+        "color":     color,
+        "auto_join": auto_join,
+    }
+
+    try:
+        r = await _http.post(
+            "/rest/v1/geo_zones",
+            json=payload,
+            headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+        )
+        r.raise_for_status()
+        return JSONResponse({"ok": True})
+    except httpx.HTTPStatusError as e:
+        log.error("Supabase upsert zone failed: %s  body=%s", e, e.response.text)
+        return JSONResponse({"error": "upstream error"}, status_code=502)
+    except Exception as e:
+        log.exception("upsert_zone error: %s", e)
+        return JSONResponse({"error": "server error"}, status_code=500)
+
+
+# ── Supabase proxy: DELETE /zones/<id>?device_id=<device_id> ─────────────────
+@app.delete("/zones/{zone_id}")
+async def delete_zone(zone_id: str, request: Request) -> JSONResponse:
+    """
+    Proxy DELETE to Supabase. Enforces device_id ownership server-side.
+    """
+    device_id = _sanitize_device(request.query_params.get("device_id", ""))
+    zone_id   = _sanitize_device(zone_id)
+    if not device_id or not zone_id:
+        return JSONResponse({"error": "device_id and zone_id required"}, status_code=400)
+
+    try:
+        r = await _http.delete(
+            "/rest/v1/geo_zones",
+            params={
+                "id":        f"eq.{zone_id}",
+                "device_id": f"eq.{device_id}",
+            },
+        )
+        r.raise_for_status()
+        return JSONResponse({"ok": True})
+    except httpx.HTTPStatusError as e:
+        log.error("Supabase delete zone failed: %s", e)
+        return JSONResponse({"error": "upstream error"}, status_code=502)
+    except Exception as e:
+        log.exception("delete_zone error: %s", e)
+        return JSONResponse({"error": "server error"}, status_code=500)
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _sanitize_name(raw: str, fallback: str) -> str:
-    """Lowercase, spaces -> underscores, strip non [a-z0-9_-], truncate."""
     cleaned = _NAME_RE.sub("", (raw or "").strip().lower().replace(" ", "_"))
     return cleaned[:MAX_NAME_LEN] or fallback[:MAX_NAME_LEN]
 
 
 def _sanitize_room(raw: str) -> str:
-    """Uppercase, strip non [A-Z0-9_-], truncate."""
     return _ROOM_RE.sub("", (raw or "").strip().upper())[:MAX_ROOM_LEN]
 
 
+def _sanitize_device(raw: str) -> str:
+    """Strip anything that isn't alphanumeric, _, or - from device/zone IDs."""
+    return _DEVICE_RE.sub("", (raw or "").strip())[:128]
+
+
+def _validate_color(raw: object) -> str:
+    """Accept hex colors only. Falls back to blue."""
+    s = str(raw or "").strip()
+    import re as _re
+    return s if _re.match(r"^#[0-9a-fA-F]{6}$", s) else "#007aff"
+
+
 def _room_members(room_id: str) -> list[dict]:
-    """
-    Snapshot the room's sid set before iterating so a concurrent coroutine
-    cannot cause a RuntimeError on set mutation mid-loop.
-    """
     snapshot = frozenset(rooms.get(room_id, set()))
     return [
         {"sid": sid, "name": users[sid]["name"]}
@@ -125,17 +284,11 @@ def _room_members(room_id: str) -> list[dict]:
 
 
 def _leave_room(sid: str) -> tuple[str | None, str]:
-    """
-    Remove sid from its room index and clear users[sid]["room"].
-    Returns (old_room_id, display_name). Safe to call if sid is unknown.
-    """
     info = users.get(sid)
     if not info:
         return None, sid[:6]
-
     old_room = info.get("room")
     name     = info.get("name") or sid[:6]
-
     if old_room:
         room_set = rooms.get(old_room)
         if room_set is not None:
@@ -143,30 +296,20 @@ def _leave_room(sid: str) -> tuple[str | None, str]:
             if not room_set:
                 del rooms[old_room]
         info["room"] = None
-
     return old_room, name
 
 
 def _check_rate(sid: str) -> bool:
-    """
-    Sliding-window rate limiter using a deque for O(1) amortised eviction.
-    Returns True when the message should be allowed through.
-    """
     info = users.get(sid)
     if not info:
         return False
-
     now    = time.monotonic()
     times: deque = info.setdefault("msg_times", deque())
     cutoff = now - MSG_RATE_WINDOW
-
-    # Pop expired timestamps from the left — O(1) per pop on a deque
     while times and times[0] <= cutoff:
         times.popleft()
-
     if len(times) >= MAX_MSG_RATE:
         return False
-
     times.append(now)
     return True
 
@@ -175,7 +318,6 @@ def _check_rate(sid: str) -> bool:
 
 @sio.event
 async def connect(sid: str, environ: dict) -> None:
-    # No user record exists yet — meaningful logging happens in join_room.
     pass
 
 
@@ -183,24 +325,16 @@ async def connect(sid: str, environ: dict) -> None:
 async def disconnect(sid: str) -> None:
     old_room: str | None = None
     name: str | None     = None
-
     try:
         old_room, name = _leave_room(sid)
     except Exception as exc:
         log.exception("_leave_room error on disconnect sid=%s: %s", sid, exc)
     finally:
-        # Always remove the user record, even if _leave_room raised
         users.pop(sid, None)
 
     log.info("[-] %-24s @%-16s left %s", sid, name or "?", old_room or "(no room)")
-
     if old_room and name:
-        await sio.emit(
-            "peer_left",
-            {"sid": sid, "name": name},
-            room=old_room,
-            skip_sid=sid,
-        )
+        await sio.emit("peer_left", {"sid": sid, "name": name}, room=old_room, skip_sid=sid)
 
 
 @sio.event
@@ -208,36 +342,19 @@ async def join_room(sid: str, data: dict) -> None:
     try:
         room = _sanitize_room(data.get("room", ""))
         name = _sanitize_name(data.get("name", ""), sid[:6])
-
         if not room:
             return
 
-        # Leave current room first so the capacity check below never counts
-        # the user against their own seat when they rejoin the same room.
         old_room, _ = _leave_room(sid)
-
         if old_room and old_room != room:
             await sio.leave_room(sid, old_room)
-            await sio.emit(
-                "peer_left",
-                {"sid": sid, "name": name},
-                room=old_room,
-                skip_sid=sid,
-            )
-            log.info("   %-24s left  %s", sid, old_room)
+            await sio.emit("peer_left", {"sid": sid, "name": name}, room=old_room, skip_sid=sid)
 
-        # Capacity check (after leaving — self-rejoin always succeeds)
         new_size = len(rooms.get(room, set()))
         if new_size >= MAX_ROOM_SIZE:
-            await sio.emit(
-                "error",
-                {"code": "ROOM_FULL", "msg": f"Room is full ({MAX_ROOM_SIZE} max)"},
-                to=sid,
-            )
-            log.warning("   Room %s full (%d) — rejected %s", room, new_size, sid)
+            await sio.emit("error", {"code": "ROOM_FULL", "msg": f"Room is full ({MAX_ROOM_SIZE} max)"}, to=sid)
             return
 
-        # Register user, preserving rate-limit history across room switches
         existing = users.get(sid, {})
         users[sid] = {
             "room":      room,
@@ -248,17 +365,12 @@ async def join_room(sid: str, data: dict) -> None:
         rooms.setdefault(room, set()).add(sid)
         await sio.enter_room(sid, room)
 
-        # Notify peers and send room state concurrently — saves one round-trip
         members = _room_members(room)
         await asyncio.gather(
             sio.emit("peer_joined", {"sid": sid, "name": name}, room=room, skip_sid=sid),
             sio.emit("room_state",  {"members": members},        to=sid),
         )
-
-        log.info(
-            "[+] %-24s @%-16s joined  %-20s (%d members)",
-            sid, name, room, len(members),
-        )
+        log.info("[+] %-24s @%-16s joined  %-20s (%d)", sid, name, room, len(members))
 
     except Exception as exc:
         log.exception("join_room error sid=%s: %s", sid, exc)
@@ -270,13 +382,7 @@ async def leave_room_event(sid: str, data: dict) -> None:
         old_room, name = _leave_room(sid)
         if old_room:
             await sio.leave_room(sid, old_room)
-            await sio.emit(
-                "peer_left",
-                {"sid": sid, "name": name},
-                room=old_room,
-                skip_sid=sid,
-            )
-            log.info("   %-24s @%-16s voluntarily left %s", sid, name, old_room)
+            await sio.emit("peer_left", {"sid": sid, "name": name}, room=old_room, skip_sid=sid)
     except Exception as exc:
         log.exception("leave_room_event error sid=%s: %s", sid, exc)
 
@@ -291,12 +397,7 @@ async def update_name(sid: str, data: dict) -> None:
         users[sid]["name"] = new_name
         room               = users[sid].get("room")
         if room:
-            await sio.emit(
-                "peer_name_updated",
-                {"sid": sid, "name": new_name},
-                room=room,
-                skip_sid=sid,
-            )
+            await sio.emit("peer_name_updated", {"sid": sid, "name": new_name}, room=room, skip_sid=sid)
         log.info("   @%-16s renamed -> @%s", old_name, new_name)
     except Exception as exc:
         log.exception("update_name error sid=%s: %s", sid, exc)
@@ -308,18 +409,11 @@ async def voice_message(sid: str, data: dict) -> None:
         info = users.get(sid)
         if not info:
             return
-
         room = info.get("room")
         if not room:
             return
-
         if not _check_rate(sid):
-            await sio.emit(
-                "error",
-                {"code": "RATE_LIMITED", "msg": "Sending too fast — wait a moment"},
-                to=sid,
-            )
-            log.warning("   Rate-limited @%s in %s", info["name"], room)
+            await sio.emit("error", {"code": "RATE_LIMITED", "msg": "Sending too fast"}, to=sid)
             return
 
         audio  = data.get("audio", "")
@@ -335,15 +429,9 @@ async def voice_message(sid: str, data: dict) -> None:
         if not audio:
             return
 
-        # Measure once — len() on a large str is O(n) in CPython
         audio_len = len(audio)
         if audio_len > MAX_AUDIO_BYTES:
-            await sio.emit(
-                "error",
-                {"code": "MSG_TOO_LARGE", "msg": "Audio too large"},
-                to=sid,
-            )
-            log.warning("   Too large from @%s  (%d B)", info["name"], audio_len)
+            await sio.emit("error", {"code": "MSG_TOO_LARGE", "msg": "Audio too large"}, to=sid)
             return
 
         if mime not in ALLOWED_MIME:
@@ -362,11 +450,7 @@ async def voice_message(sid: str, data: dict) -> None:
             room=room,
             skip_sid=sid,
         )
-
-        log.info(
-            "   Voice  @%-16s -> %-20s  %.1fs  %d B",
-            info["name"], room, duration, audio_len,
-        )
+        log.info("   Voice  @%-16s -> %-20s  %.1fs  %d B", info["name"], room, duration, audio_len)
 
     except Exception as exc:
         log.exception("voice_message error sid=%s: %s", sid, exc)

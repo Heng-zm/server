@@ -173,20 +173,22 @@ async def _lifespan(app: FastAPI):
     log.info("WalkieTalk stopped  instance=%s  local_connections=%d", INSTANCE_ID, len(_local_users))
 
 
-# ── Socket.IO — with Redis manager if available, memory manager if not ────────
 def _build_sio() -> socketio.AsyncServer:
     """
-    Build the AsyncServer. We always start with the memory manager here;
-    the Redis manager is swapped in after Redis connects in lifespan
-    (python-socketio requires the manager at construction time, so we use
-    a deferred pattern: build with memory, replace if Redis available).
-
-    For production: set REDIS_URL and the AsyncRedisManager handles
-    cross-instance pub/sub transparently. sio.emit() calls on any instance
-    publish to the Redis channel and every instance fans out to its locals.
+    Build the AsyncServer. 
+    Verifies the redis package is present before using AsyncRedisManager,
+    falling back to the local memory manager if missing or misconfigured.
     """
     if REDIS_URL:
         try:
+            # Explicitly verify the redis package is installed.
+            # python-socketio doesn't check this until its background thread starts,
+            # which causes thread crashes if the package is missing.
+            try:
+                import redis.asyncio
+            except ImportError:
+                import aioredis  # Fallback for older environments
+            
             mgr = socketio.AsyncRedisManager(REDIS_URL, channel="walkie_sio")
             log.info("Using AsyncRedisManager for socket pub/sub")
             return socketio.AsyncServer(
@@ -199,9 +201,12 @@ def _build_sio() -> socketio.AsyncServer:
                 logger=False,
                 engineio_logger=False,
             )
+        except ImportError:
+            log.warning("REDIS_URL is set but the 'redis' package is missing. Using memory manager.")
         except Exception as exc:
             log.warning("AsyncRedisManager init failed (%s) — using memory manager", exc)
 
+    # Memory manager fallback
     return socketio.AsyncServer(
         async_mode="asgi",
         cors_allowed_origins="*",

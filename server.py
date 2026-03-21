@@ -19,6 +19,8 @@ import logging
 import os
 import re
 import time
+import math
+import statistics
 from collections import deque
 from contextlib import asynccontextmanager
 from typing import Deque
@@ -156,10 +158,128 @@ _local_msg_times: dict[str, Deque[float]]     = {}   # FIX 8: correctly typed as
 
 INSTANCE_ID = f"inst_{os.getpid()}_{int(time.time()) % 10000}"
 
-# ── Health ping cache (FIX 10) ────────────────────────────────────────────────
+# ── Health ping cache ────────────────────────────────────────────────────────
 _last_ping_ok:   bool  = False
 _last_ping_time: float = 0.0
 _PING_CACHE_TTL: float = 10.0
+
+# ── Connection quality ────────────────────────────────────────────────────────
+# Each connected sid gets an asyncio Task that pings every QUALITY_INTERVAL
+# seconds, records RTT + drop, computes a 0-100 score, and emits quality_update.
+QUALITY_INTERVAL:   float = 30.0   # seconds between quality measurements
+QUALITY_PING_TMO:   float = 5.0    # seconds to wait for a pong before marking drop
+QUALITY_RTT_WINDOW: int   = 5      # keep last N RTT samples for median/jitter
+QUALITY_CYCLE_WIN:  int   = 5      # keep last N ping cycles for drop rate
+
+# Per-sid quality state — keyed by sid, cleaned up on disconnect
+# {
+#   "pending": {nonce: sent_time},   # unanswered pings
+#   "rtts":    deque[float],         # recent RTT samples in ms
+#   "cycles":  deque[bool],          # True=received, False=dropped
+#   "task":    asyncio.Task,         # per-sid background task
+# }
+_quality: dict[str, dict] = {}
+
+
+def _quality_score(rtts: deque, cycles: deque) -> tuple[int, float, float, float]:
+    """
+    Returns (score 0-100, median_rtt_ms, drop_pct, jitter_ms).
+    Scoring weights:
+      latency  50 pts — linear decay 0→100ms=50, 100→400ms=25, 400ms+=0
+      drop     30 pts — linear decay 0%=30, 50%+=0
+      jitter   20 pts — linear decay 0→20ms=20, 20→150ms=10, 150ms+=0
+    """
+    if not rtts:
+        return 100, 0.0, 0.0, 0.0
+
+    median_rtt = statistics.median(rtts)
+    jitter     = statistics.stdev(rtts) if len(rtts) >= 2 else 0.0
+    drop_pct   = (cycles.count(False) / len(cycles) * 100) if cycles else 0.0
+
+    # Latency score (50 pts)
+    if median_rtt <= 100:
+        lat_score = 50.0
+    elif median_rtt <= 400:
+        lat_score = 50.0 - (median_rtt - 100) / 300 * 25
+    else:
+        lat_score = max(0.0, 25.0 - (median_rtt - 400) / 200 * 25)
+
+    # Drop score (30 pts)
+    drop_score = max(0.0, 30.0 - drop_pct / 50 * 30)
+
+    # Jitter score (20 pts)
+    if jitter <= 20:
+        jit_score = 20.0
+    elif jitter <= 150:
+        jit_score = 20.0 - (jitter - 20) / 130 * 10
+    else:
+        jit_score = max(0.0, 10.0 - (jitter - 150) / 100 * 10)
+
+    score = round(lat_score + drop_score + jit_score)
+    return max(0, min(100, score)), round(median_rtt, 1), round(drop_pct, 1), round(jitter, 1)
+
+
+async def _quality_task(sid: str) -> None:
+    """
+    Per-sid background task. Runs until cancelled (on disconnect).
+    Each cycle:
+      1. Emit quality_ping with a unique nonce + server timestamp.
+      2. Wait QUALITY_PING_TMO seconds for pong.
+      3. Record drop or RTT.
+      4. Every QUALITY_INTERVAL seconds (after first cycle) emit quality_update.
+    """
+    state = _quality.setdefault(sid, {
+        "pending": {},
+        "rtts":    deque(maxlen=QUALITY_RTT_WINDOW),
+        "cycles":  deque(maxlen=QUALITY_CYCLE_WIN),
+    })
+    cycle = 0
+    try:
+        while True:
+            await asyncio.sleep(QUALITY_INTERVAL)
+            if sid not in _local_users and not (
+                _redis and await _redis.hexists(_RK_PRESENCE, sid)
+            ):
+                break  # sid gone from both local + redis — stop quietly
+
+            # Send ping
+            nonce    = f"{sid[:8]}_{cycle}"
+            sent_at  = time.monotonic()
+            state["pending"][nonce] = sent_at
+            await sio.emit("quality_ping", {"nonce": nonce}, to=sid)
+            cycle += 1
+
+            # Wait for pong (checked by quality_pong event handler)
+            await asyncio.sleep(QUALITY_PING_TMO)
+
+            # If nonce still in pending → drop
+            if nonce in state["pending"]:
+                del state["pending"][nonce]
+                state["cycles"].append(False)
+                log.debug("quality drop  sid=%s  nonce=%s", sid[:8], nonce)
+            # (RTT already recorded in quality_pong if received)
+
+            # Emit score to client
+            score, median_rtt, drop_pct, jitter = _quality_score(
+                state["rtts"], state["cycles"]
+            )
+            await sio.emit("quality_update", {
+                "score":      score,
+                "latency_ms": median_rtt,
+                "drop_pct":   drop_pct,
+                "jitter_ms":  jitter,
+            }, to=sid)
+            log.info(
+                "   quality sid=%-8s  score=%3d  rtt=%.0fms  drop=%.0f%%  jitter=%.0fms",
+                sid[:8], score, median_rtt, drop_pct, jitter,
+            )
+
+    except asyncio.CancelledError:
+        pass  # normal on disconnect
+    except Exception as exc:
+        log.warning("quality_task sid=%s error: %s", sid[:8], exc)
+    finally:
+        _quality.pop(sid, None)
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -218,6 +338,11 @@ async def _lifespan(app: FastAPI):
             await _redis.aclose()
 
     await _http.aclose()
+    # Cancel any remaining quality tasks
+    for sid, q in list(_quality.items()):
+        if (t := q.get("task")) and not t.done():
+            t.cancel()
+    _quality.clear()
     log.info("WalkieTalk stopped  instance=%s", INSTANCE_ID)
 
 
@@ -547,11 +672,22 @@ async def delete_zone(zone_id: str, request: Request) -> JSONResponse:
 
 @sio.event
 async def connect(sid: str, environ: dict) -> None:
-    pass
+    # Spin up per-sid quality measurement task
+    task = asyncio.create_task(_quality_task(sid), name=f"quality_{sid[:8]}")
+    _quality.setdefault(sid, {
+        "pending": {},
+        "rtts":    deque(maxlen=QUALITY_RTT_WINDOW),
+        "cycles":  deque(maxlen=QUALITY_CYCLE_WIN),
+    })["task"] = task
 
 
 @sio.event
 async def disconnect(sid: str) -> None:
+    # Cancel quality task before cleaning state
+    q = _quality.pop(sid, None)
+    if q and (t := q.get("task")) and not t.done():
+        t.cancel()
+
     try:
         old_room, name = await _leave_room(sid)
     except Exception as exc:
@@ -684,6 +820,27 @@ async def voice_message(sid: str, data: dict) -> None:
 
     except Exception as exc:
         log.exception("voice_message sid=%s: %s", sid, exc)
+
+
+@sio.event
+async def quality_pong(sid: str, data: dict) -> None:
+    """Client echoes quality_ping back — record RTT and mark cycle as received."""
+    try:
+        nonce = str(data.get("nonce", ""))
+        if not nonce:
+            return
+        state = _quality.get(sid)
+        if not state:
+            return
+        sent_at = state["pending"].pop(nonce, None)
+        if sent_at is None:
+            return  # already timed out and counted as drop
+        rtt_ms = (time.monotonic() - sent_at) * 1000
+        state["rtts"].append(rtt_ms)
+        state["cycles"].append(True)
+        log.debug("quality pong  sid=%s  rtt=%.1fms", sid[:8], rtt_ms)
+    except Exception as exc:
+        log.exception("quality_pong sid=%s: %s", sid, exc)
 
 
 @sio.event

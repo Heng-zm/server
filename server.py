@@ -80,7 +80,24 @@ _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")   # FIX 3: was recompiled every cal
 
 _start_time = time.time()
 
-# ── Lua scripts — module-level constants (FIX 1: was rebuilt per call) ────────
+# ── Lua scripts — module-level constants ──────────────────────────────────────
+
+# Atomic rate check + record: evict expired, check count, conditionally add
+# Returns 1 if allowed, 0 if rate-limited — all in one round-trip (BUG 5+11)
+_LUA_RATE = """
+local key    = KEYS[1]
+local cutoff = ARGV[1]
+local member = ARGV[2]
+local score  = ARGV[3]
+local limit  = tonumber(ARGV[4])
+local ttl    = tonumber(ARGV[5])
+redis.call('zremrangebyscore', key, '-inf', cutoff)
+local count = redis.call('zcard', key)
+if count >= limit then return 0 end
+redis.call('zadd', key, score, member)
+redis.call('expire', key, ttl)
+return 1
+"""
 
 # Atomic join: check capacity + register user in one Redis round-trip
 _LUA_JOIN = """
@@ -100,31 +117,32 @@ redis.call('sadd', room_key, sid)
 redis.call('hset', user_key, 'room', room, 'name', name, 'joined_at', now)
 redis.call('expire', user_key, ttl)
 redis.call('hset', pres_key, sid, inst)
+redis.call('expire', room_key, ttl)
 return 1
 """
 
-# Atomic leave: remove from room + user + presence + cleanup empty room
+# Atomic leave: hget room+name, remove user+presence, clean empty room
+# BUG1: was 'delete' (invalid), now 'del'
+# BUG2: now reads room from the hash itself, not from a stale room_key arg
+# BUG4: returns nil sentinel so caller can distinguish "not found" from empty room
 _LUA_LEAVE = """
-local room_key = KEYS[1]
-local user_key = KEYS[2]
-local pres_key = KEYS[3]
+local user_key = KEYS[1]
+local pres_key = KEYS[2]
 local sid      = ARGV[1]
-local data = redis.call('hgetall', user_key)
-if #data == 0 then return {false, ''} end
-local old_room, name = '', ''
-for i = 1, #data, 2 do
-    if data[i] == 'room' then old_room = data[i+1]
-    elseif data[i] == 'name' then name = data[i+1] end
-end
-redis.call('delete', user_key)
+local room_pfx = ARGV[2]
+local room = redis.call('hget', user_key, 'room')
+local name = redis.call('hget', user_key, 'name')
+if not room then return {nil, nil} end
+redis.call('del', user_key)
 redis.call('hdel', pres_key, sid)
-if old_room ~= '' then
-    redis.call('srem', room_key, sid)
-    if redis.call('scard', room_key) == 0 then
-        redis.call('del', room_key)
+if room ~= '' then
+    local rk = room_pfx .. room
+    redis.call('srem', rk, sid)
+    if redis.call('scard', rk) == 0 then
+        redis.call('del', rk)
     end
 end
-return {old_room, name}
+return {room, name or ''}
 """
 
 # ── Shared clients ─────────────────────────────────────────────────────────────
@@ -264,21 +282,21 @@ async def _redis_atomic_join(sid: str, room: str, name: str) -> bool:
 
 async def _redis_leave(sid: str, known_room: str | None) -> tuple[str | None, str]:
     """
-    FIX 5+9: Single Lua round-trip for leave — removes user, presence,
-    and cleans empty room atomically. known_room avoids HGETALL when local
-    state already has the room.
+    Single Lua round-trip: reads room from hash, removes user+presence,
+    cleans empty room. Returns (old_room, name).
+    BUG2 fix: Lua now reads room from hash — no stale room_key arg.
+    BUG4 fix: nil check uses `is None`, not falsy, to distinguish not-found.
     """
     if not _redis:
         return None, sid[:6]
 
-    # If we already know the room, skip the HGETALL inside Lua
-    room_key = _RK_ROOM + (known_room or "")
     result = await _redis.eval(
-        _LUA_LEAVE, 3,
-        room_key, _RK_USER + sid, _RK_PRESENCE,
-        sid,
+        _LUA_LEAVE, 2,
+        _RK_USER + sid, _RK_PRESENCE,
+        sid, _RK_ROOM,
     )
-    if not result or not result[0]:
+    # result is [None, None] if user not in Redis — fall back to known_room
+    if not result or result[0] is None:
         return known_room, sid[:6]
     return result[0] or known_room, result[1] or sid[:6]
 
@@ -299,8 +317,8 @@ async def _redis_room_members(room: str) -> list[dict]:
 
 async def _redis_check_rate(sid: str) -> bool:
     """
-    FIX 12: Check count BEFORE adding so we never need a zrem undo.
-    Saves one Redis round-trip on every denied message.
+    BUG 5+11: Single Lua round-trip — evict + count + conditionally zadd atomically.
+    Eliminates the separate zadd call that could be lost on timeout.
     """
     if not _redis:
         return _local_check_rate(sid)
@@ -310,19 +328,13 @@ async def _redis_check_rate(sid: str) -> bool:
     key    = _RK_RATE + sid
     member = f"{now:.6f}:{sid}"
 
-    pipe = _redis.pipeline(transaction=False)
-    pipe.zremrangebyscore(key, "-inf", cutoff)   # evict expired
-    pipe.zcard(key)                               # count BEFORE adding
-    pipe.expire(key, _RATE_TTL)
-    results = await pipe.execute()
-    current_count: int = results[1]
-
-    if current_count >= MAX_MSG_RATE:
-        return False   # denied — no zadd needed, no undo needed
-
-    # Allowed — now record this attempt
-    await _redis.zadd(key, {member: now})
-    return True
+    result = await _redis.eval(
+        _LUA_RATE, 1,
+        key,
+        f"{cutoff:.6f}", member, f"{now:.6f}",
+        str(MAX_MSG_RATE), str(_RATE_TTL),
+    )
+    return bool(result)
 
 
 async def _redis_sid_exists(sid: str) -> bool:
@@ -339,15 +351,13 @@ async def _leave_room(sid: str) -> tuple[str | None, str]:
     name_loc = info.get("name", sid[:6]) if info else sid[:6]
 
     # Clean local state
-    if info:
-        if known:
-            room_set = _local_rooms.get(known)
-            if room_set is not None:
-                room_set.discard(sid)
-                if not room_set:
-                    del _local_rooms[known]
-        info["room"] = None
-    _local_users.pop(sid, None)
+    if info and known:
+        room_set = _local_rooms.get(known)
+        if room_set is not None:
+            room_set.discard(sid)
+            if not room_set:
+                del _local_rooms[known]
+    _local_users.pop(sid, None)      # pop removes it entirely — no need to null room field
     _local_msg_times.pop(sid, None)
 
     if _redis:
@@ -574,10 +584,11 @@ async def join_room(sid: str, data: dict) -> None:
 
         await sio.enter_room(sid, room)
 
-        # FIX 17: _redis_room_members is an async function and handles the local fallback internally 
-        # when _redis is None. No need for asyncio.coroutine.
-        members = await _redis_room_members(room)
-        
+        # Get member list (local sync fn wrapped for uniform await pattern)
+        if _redis:
+            members = await _redis_room_members(room)
+        else:
+            members = _local_room_members(room)
         await asyncio.gather(
             sio.emit("peer_joined", {"sid": sid, "name": name}, room=room, skip_sid=sid),
             sio.emit("room_state",  {"members": members}, to=sid),
@@ -586,6 +597,7 @@ async def join_room(sid: str, data: dict) -> None:
 
     except Exception as exc:
         log.exception("join_room sid=%s: %s", sid, exc)
+
 
 @sio.event
 async def leave_room_event(sid: str, data: dict) -> None:
@@ -605,11 +617,16 @@ async def update_name(sid: str, data: dict) -> None:
         if not new_name:
             return
         info = _local_users.get(sid)
-        if not info:
-            return
-        old_name     = info["name"]
-        info["name"] = new_name
-        room         = info.get("room")
+        old_name = info["name"] if info else sid[:6]
+        room     = info.get("room") if info else None
+
+        # BUG 10: if user joined on another instance, local lookup misses —
+        # fall back to Redis for room lookup so broadcast still fires
+        if info:
+            info["name"] = new_name
+        if not room and _redis:
+            room = await _redis.hget(_RK_USER + sid, "room")
+
         if _redis:
             await _redis.hset(_RK_USER + sid, "name", new_name)
         if room:

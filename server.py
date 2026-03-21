@@ -251,7 +251,7 @@ async def _quality_task(sid: str) -> None:
             # No presence check needed — task is cancelled by disconnect() when sid leaves
 
             # Send ping
-            nonce    = f"{sid[:8]}_{cycle}"
+            nonce    = f"{sid}_{cycle}"
             sent_at  = time.monotonic()
             state["pending"][nonce] = sent_at
             await sio.emit("quality_ping", {"nonce": nonce}, to=sid)
@@ -301,8 +301,12 @@ async def _zone_expiry_task() -> None:
     """
     log.info("Zone expiry task started  interval=%ds  ttl=%dh",
              ZONE_EXPIRY_INTERVAL, ZONE_TTL_HOURS)
+    first_run = True
     while True:
-        await asyncio.sleep(ZONE_EXPIRY_INTERVAL)
+        # Sweep immediately on startup (short delay for HTTP client to settle),
+        # then every ZONE_EXPIRY_INTERVAL seconds
+        await asyncio.sleep(5 if first_run else ZONE_EXPIRY_INTERVAL)
+        first_run = False
         if _http is None:
             continue
         try:
@@ -737,11 +741,21 @@ async def delete_zone(zone_id: str, request: Request) -> JSONResponse:
     if _http is None:
         return JSONResponse({"error": "server initializing"}, status_code=503)
     try:
-        r = await _http.delete("/rest/v1/geo_zones",
-            params={"id": f"eq.{zone_id}", "device_id": f"eq.{device_id}"})
+        r = await _http.delete(
+            "/rest/v1/geo_zones",
+            params={"id": f"eq.{zone_id}", "device_id": f"eq.{device_id}"},
+            headers={"Prefer": "return=representation"},
+        )
         if not r.is_success:
             log.error("Supabase DELETE failed %s: %s", r.status_code, r.text[:200])
             return JSONResponse({"error": "upstream error", "status": r.status_code, "detail": r.text}, status_code=502)
+        # Only broadcast if a row was actually deleted — empty array means device_id mismatch
+        try:
+            deleted_rows = r.json() if r.text and r.text.strip() not in ("", "[]") else []
+        except Exception:
+            deleted_rows = []
+        if not deleted_rows:
+            return JSONResponse({"error": "not found or not owner"}, status_code=404)
         await sio.emit("zone_deleted", {"id": zone_id, "device_id": device_id})
         return JSONResponse({"ok": True})
     except Exception as e:
@@ -788,10 +802,11 @@ async def join_room(sid: str, data: dict) -> None:
         if not room:
             return
 
-        old_room, _ = await _leave_room(sid)
+        old_room, old_name = await _leave_room(sid)
         if old_room and old_room != room:
             await sio.leave_room(sid, old_room)
-            await sio.emit("peer_left", {"sid": sid, "name": name}, room=old_room, skip_sid=sid)
+            # Use old_name — peers in the old room knew them by that name
+            await sio.emit("peer_left", {"sid": sid, "name": old_name}, room=old_room, skip_sid=sid)
 
         admitted = await _redis_atomic_join(sid, room, name)
         if not admitted:
@@ -839,12 +854,13 @@ async def update_name(sid: str, data: dict) -> None:
 
         # BUG 10: if user joined on another instance, local lookup misses —
         # fall back to Redis for room lookup so broadcast still fires
+        name_changed = not info or info.get("name") != new_name
         if info:
             info["name"] = new_name
         if not room and _redis:
             room = await _redis.hget(_RK_USER + sid, "room")
 
-        if _redis:
+        if _redis and name_changed:
             await _redis.hset(_RK_USER + sid, "name", new_name)
         if room:
             await sio.emit("peer_name_updated", {"sid": sid, "name": new_name}, room=room, skip_sid=sid)
@@ -866,10 +882,12 @@ async def voice_message(sid: str, data: dict) -> None:
             if not room:
                 return
 
-        name   = info.get("name", sid[:6]) if info else sid[:6]
-        audio  = data.get("audio", "")
+        name  = info.get("name", sid[:6]) if info else sid[:6]
+        audio = data.get("audio") or ""
         if not audio:
             return
+        if not isinstance(audio, str):
+            return  # reject non-string payloads (malformed client)
 
         # Check size BEFORE rate limit — reject oversized blobs without burning a rate slot
         audio_len = len(audio)
@@ -882,7 +900,7 @@ async def voice_message(sid: str, data: dict) -> None:
             await sio.emit("error", {"code": "RATE_LIMITED", "msg": "Sending too fast"}, to=sid)
             return
 
-        mime = str(data.get("mime", "audio/webm"))
+        mime = str(data.get("mime") or "audio/webm")
         if mime not in ALLOWED_MIME:
             mime = "audio/webm"
 

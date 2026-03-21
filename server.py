@@ -19,7 +19,6 @@ import logging
 import os
 import re
 import time
-import math
 import statistics
 from datetime import datetime, timezone, timedelta
 from collections import deque
@@ -231,19 +230,13 @@ async def _quality_task(sid: str) -> None:
       3. Record drop or RTT.
       4. Every QUALITY_INTERVAL seconds (after first cycle) emit quality_update.
     """
-    state = _quality.setdefault(sid, {
-        "pending": {},
-        "rtts":    deque(maxlen=QUALITY_RTT_WINDOW),
-        "cycles":  deque(maxlen=QUALITY_CYCLE_WIN),
-    })
+    # State is pre-created in connect() before this task starts
+    state = _quality[sid]
     cycle = 0
     try:
         while True:
             await asyncio.sleep(QUALITY_INTERVAL)
-            if sid not in _local_users and not (
-                _redis and await _redis.hexists(_RK_PRESENCE, sid)
-            ):
-                break  # sid gone from both local + redis — stop quietly
+            # No presence check needed — task is cancelled by disconnect() when sid leaves
 
             # Send ping
             nonce    = f"{sid[:8]}_{cycle}"
@@ -278,11 +271,9 @@ async def _quality_task(sid: str) -> None:
             )
 
     except asyncio.CancelledError:
-        pass  # normal on disconnect
+        pass  # normal on disconnect — state already cleaned in disconnect()
     except Exception as exc:
         log.warning("quality_task sid=%s error: %s", sid[:8], exc)
-    finally:
-        _quality.pop(sid, None)
 
 
 # ── Zone expiry background task ───────────────────────────────────────────────
@@ -312,17 +303,20 @@ async def _zone_expiry_task() -> None:
                 deleted = r.json() if r.text and r.text != "[]" else []
                 if deleted:
                     log.info("Zone expiry: deleted %d expired zones", len(deleted))
-                    for z in deleted:
-                        await sio.emit("zone_deleted", {
+                    # Broadcast all deletions concurrently — no need to wait for each
+                    await asyncio.gather(*[
+                        sio.emit("zone_deleted", {
                             "id":        z.get("id", ""),
                             "device_id": z.get("device_id", ""),
                             "expired":   True,
                         })
+                        for z in deleted
+                    ])
             else:
                 log.warning("Zone expiry DELETE failed %s: %s",
                             r.status_code, r.text[:200])
         except asyncio.CancelledError:
-            break
+            raise  # propagate so lifespan knows we stopped cleanly
         except Exception as exc:
             log.warning("Zone expiry task error: %s", exc)
     log.info("Zone expiry task stopped")
@@ -382,6 +376,16 @@ async def _lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
+    # Cancel quality tasks FIRST — before Redis closes so tasks don't hit a dead connection
+    for sid, q in list(_quality.items()):
+        if (t := q.get("task")) and not t.done():
+            t.cancel()
+    if _quality:
+        await asyncio.gather(*[q["task"] for q in _quality.values()
+                                if q.get("task") and not q["task"].done()],
+                             return_exceptions=True)
+    _quality.clear()
+
     if _redis:
         try:
             all_presence = await _redis.hgetall(_RK_PRESENCE)
@@ -397,11 +401,6 @@ async def _lifespan(app: FastAPI):
             await _redis.aclose()
 
     await _http.aclose()
-    # Cancel any remaining quality tasks
-    for sid, q in list(_quality.items()):
-        if (t := q.get("task")) and not t.done():
-            t.cancel()
-    _quality.clear()
     log.info("WalkieTalk stopped  instance=%s", INSTANCE_ID)
 
 
@@ -451,15 +450,16 @@ async def _redis_atomic_join(sid: str, room: str, name: str) -> bool:
         _local_rooms.setdefault(room, set()).add(sid)
         return True
 
+    now_ts = time.time()
     result = await _redis.eval(
         _LUA_JOIN, 3,
         _RK_ROOM + room, _RK_USER + sid, _RK_PRESENCE,
         sid, room, name,
-        str(MAX_ROOM_SIZE), f"{time.time():.3f}", INSTANCE_ID, str(_USER_TTL),
+        str(MAX_ROOM_SIZE), f"{now_ts:.3f}", INSTANCE_ID, str(_USER_TTL),
     )
     admitted = bool(result)
     if admitted:
-        _local_users[sid] = {"room": room, "name": name, "joined_at": time.time()}
+        _local_users[sid] = {"room": room, "name": name, "joined_at": now_ts}
         _local_rooms.setdefault(room, set()).add(sid)
     return admitted
 
@@ -521,10 +521,6 @@ async def _redis_check_rate(sid: str) -> bool:
     return bool(result)
 
 
-async def _redis_sid_exists(sid: str) -> bool:
-    if _redis:
-        return bool(await _redis.hexists(_RK_PRESENCE, sid))
-    return sid in _local_users
 
 
 # ── Unified leave (local + Redis in one call) ─────────────────────────────────
@@ -640,7 +636,8 @@ async def get_zones(request: Request) -> JSONResponse:
         if not r.is_success:
             log.error("Supabase GET failed %s: %s", r.status_code, r.text[:200])
             return JSONResponse({"error": "upstream error", "status": r.status_code, "detail": r.text}, status_code=502)
-        return JSONResponse(r.json())
+        from fastapi.responses import Response
+        return Response(content=r.content, media_type="application/json")
     except Exception as e:
         log.exception("get_zones: %s", e)
         return JSONResponse({"error": "server error", "detail": str(e)}, status_code=500)
@@ -648,6 +645,9 @@ async def get_zones(request: Request) -> JSONResponse:
 
 @app.post("/zones")
 async def upsert_zone(request: Request) -> JSONResponse:
+    # Guard before parsing body — saves work when server is still initializing
+    if _http is None:
+        return JSONResponse({"error": "server initializing"}, status_code=503)
     try:
         body = await request.json()
     except Exception:
@@ -688,8 +688,6 @@ async def upsert_zone(request: Request) -> JSONResponse:
         "expires_at": expires_at,          # set once on create; never overwritten on update
     }
 
-    if _http is None:
-        return JSONResponse({"error": "server initializing"}, status_code=503)
     try:
         r = await _http.post(
             "/rest/v1/geo_zones", json=payload,
@@ -851,19 +849,20 @@ async def voice_message(sid: str, data: dict) -> None:
             if not room:
                 return
 
-        # Rate check (Redis pipeline, FIX 12)
-        if not await _redis_check_rate(sid):
-            await sio.emit("error", {"code": "RATE_LIMITED", "msg": "Sending too fast"}, to=sid)
-            return
-
         name   = info.get("name", sid[:6]) if info else sid[:6]
         audio  = data.get("audio", "")
         if not audio:
             return
 
+        # Check size BEFORE rate limit — reject oversized blobs without burning a rate slot
         audio_len = len(audio)
         if audio_len > MAX_AUDIO_BYTES:
             await sio.emit("error", {"code": "MSG_TOO_LARGE", "msg": "Audio too large"}, to=sid)
+            return
+
+        # Rate check (Redis pipeline)
+        if not await _redis_check_rate(sid):
+            await sio.emit("error", {"code": "RATE_LIMITED", "msg": "Sending too fast"}, to=sid)
             return
 
         mime = str(data.get("mime", "audio/webm"))

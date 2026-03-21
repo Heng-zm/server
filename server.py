@@ -21,6 +21,7 @@ import re
 import time
 import math
 import statistics
+from datetime import datetime, timezone, timedelta
 from collections import deque
 from contextlib import asynccontextmanager
 from typing import Deque
@@ -68,6 +69,8 @@ _RK_RATE     = "wt:rate:"
 _RK_PRESENCE = "wt:presence"
 _USER_TTL    = 3600
 _RATE_TTL    = int(MSG_RATE_WINDOW * 2)
+
+ZONE_TTL_HOURS: int = 5          # zones expire 5 hours after creation
 
 ALLOWED_MIME: frozenset[str] = frozenset({
     "audio/webm", "audio/webm;codecs=opus",
@@ -282,6 +285,49 @@ async def _quality_task(sid: str) -> None:
         _quality.pop(sid, None)
 
 
+# ── Zone expiry background task ───────────────────────────────────────────────
+ZONE_EXPIRY_INTERVAL: int = 15 * 60   # check every 15 minutes
+
+async def _zone_expiry_task() -> None:
+    """
+    Runs forever (cancelled on shutdown). Every ZONE_EXPIRY_INTERVAL seconds:
+      1. DELETE from geo_zones where expires_at <= now() via Supabase REST.
+      2. For each deleted zone broadcast zone_deleted so all clients remove it.
+    Uses the Supabase REST API's 'return=representation' to get back the IDs
+    of the rows it actually deleted, so we can broadcast precisely.
+    """
+    log.info("Zone expiry task started  interval=%ds  ttl=%dh",
+             ZONE_EXPIRY_INTERVAL, ZONE_TTL_HOURS)
+    while True:
+        await asyncio.sleep(ZONE_EXPIRY_INTERVAL)
+        if _http is None:
+            continue
+        try:
+            r = await _http.delete(
+                "/rest/v1/geo_zones",
+                params={"expires_at": "lt.now()"},
+                headers={"Prefer": "return=representation"},
+            )
+            if r.is_success:
+                deleted = r.json() if r.text and r.text != "[]" else []
+                if deleted:
+                    log.info("Zone expiry: deleted %d expired zones", len(deleted))
+                    for z in deleted:
+                        await sio.emit("zone_deleted", {
+                            "id":        z.get("id", ""),
+                            "device_id": z.get("device_id", ""),
+                            "expired":   True,
+                        })
+            else:
+                log.warning("Zone expiry DELETE failed %s: %s",
+                            r.status_code, r.text[:200])
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            log.warning("Zone expiry task error: %s", exc)
+    log.info("Zone expiry task stopped")
+
+
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
@@ -321,7 +367,20 @@ async def _lifespan(app: FastAPI):
         log.info("No REDIS_URL — single-instance mode  instance=%s", INSTANCE_ID)
 
     log.info("WalkieTalk started  pid=%d", os.getpid())
+
+    # Start background zone expiry sweep
+    _expiry_task = asyncio.create_task(
+        _zone_expiry_task(), name="zone_expiry"
+    )
+
     yield
+
+    # Cancel zone expiry task
+    _expiry_task.cancel()
+    try:
+        await _expiry_task
+    except asyncio.CancelledError:
+        pass
 
     if _redis:
         try:
@@ -574,8 +633,9 @@ async def get_zones(request: Request) -> JSONResponse:
         return JSONResponse({"error": "server initializing"}, status_code=503)
     try:
         r = await _http.get("/rest/v1/geo_zones", params={
-            "order":  "created_at.asc",
-            "select": "id,device_id,name,channel,lat,lng,radius,color,auto_join,created_by",
+            "order":      "created_at.asc",
+            "select":     "id,device_id,name,channel,lat,lng,radius,color,auto_join,created_by,expires_at",
+            "expires_at": "gte.now()",   # never return expired zones
         })
         if not r.is_success:
             log.error("Supabase GET failed %s: %s", r.status_code, r.text[:200])
@@ -615,12 +675,17 @@ async def upsert_zone(request: Request) -> JSONResponse:
     if not (10 <= radius <= 50_000):
         return JSONResponse({"error": "radius must be 10–50000 m"}, status_code=400)
 
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(hours=ZONE_TTL_HOURS)
+    ).isoformat()
+
     payload = {
         "id": zone_id, "device_id": device_id,
         "name": name or channel, "channel": channel,
         "lat": lat, "lng": lng, "radius": radius,
         "color": color, "auto_join": auto_join,
         "created_by": created_by[:32],
+        "expires_at": expires_at,          # set once on create; never overwritten on update
     }
 
     if _http is None:
@@ -640,6 +705,7 @@ async def upsert_zone(request: Request) -> JSONResponse:
             "lat": lat, "lng": lng, "radius": radius,
             "color": color, "auto_join": auto_join,
             "created_by": created_by,
+            "expires_at": expires_at,
         })
         return JSONResponse({"ok": True})
     except Exception as e:

@@ -3,9 +3,11 @@ WalkieTalk — signaling + voice relay server
 FastAPI + python-socketio (ASGI) + Redis pub/sub for multi-instance scale
 
 Environment variables:
-    SUPABASE_URL   = https://bgqeqiyfgpdvgeepignt.supabase.co
-    SUPABASE_KEY   = sb_publishable_eLoAp9t0x-t7id3a-3LUow_SaBM6EC6
-    REDIS_URL      = redis://localhost:6379   (empty = single-instance mode)
+    SUPABASE_URL        = https://bgqeqiyfgpdvgeepignt.supabase.co
+    SUPABASE_KEY        = sb_publishable_eLoAp9t0x-t7id3a-3LUow_SaBM6EC6
+    REDIS_URL           = redis://localhost:6379   (empty = single-instance mode)
+    RENDER_EXTERNAL_URL = set automatically by Render — used for self-ping keepalive
+                          (set SERVER_URL manually on other platforms)
 
 Run locally:
     uvicorn server:socket_app --host 0.0.0.0 --port 3000 --reload
@@ -43,6 +45,14 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL",
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY",
     "sb_publishable_eLoAp9t0x-t7id3a-3LUow_SaBM6EC6")
 REDIS_URL    = os.environ.get("REDIS_URL", "")
+
+# Render free tier spins down after 15 min of inactivity.
+# RENDER_EXTERNAL_URL is injected automatically by Render on every web service.
+# On other platforms set SERVER_URL manually, or leave blank to disable keepalive.
+KEEPALIVE_URL = (
+    os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    or os.environ.get("SERVER_URL", "").rstrip("/")
+)
 
 _SB_HEADERS = {
     "apikey":        SUPABASE_KEY,
@@ -168,6 +178,9 @@ INSTANCE_ID = f"inst_{os.getpid()}_{int(time.time()) % 10000}"
 _last_ping_ok:   bool  = False
 _last_ping_time: float = 0.0
 _PING_CACHE_TTL: float = 10.0
+
+# Self-ping interval — must be shorter than Render's 15-min spin-down window
+KEEPALIVE_INTERVAL: int = 10 * 60   # 10 minutes
 
 # ── Connection quality ────────────────────────────────────────────────────────
 # Each connected sid gets an asyncio Task that pings every QUALITY_INTERVAL
@@ -341,6 +354,39 @@ async def _zone_expiry_task() -> None:
     log.info("Zone expiry task stopped")
 
 
+# ── Render keepalive ──────────────────────────────────────────────────────────
+async def _keepalive_task() -> None:
+    """
+    Prevents Render free-tier spin-down by pinging our own /health endpoint
+    every KEEPALIVE_INTERVAL seconds.
+
+    Uses a dedicated httpx client (separate from the Supabase _http client)
+    so a slow Supabase response never blocks the keepalive ping.
+
+    Exits silently if KEEPALIVE_URL is not set (local dev / non-Render deploy).
+    """
+    if not KEEPALIVE_URL:
+        log.info("Keepalive disabled — RENDER_EXTERNAL_URL / SERVER_URL not set")
+        return
+
+    url = f"{KEEPALIVE_URL}/health"
+    log.info("Keepalive started  url=%s  interval=%ds", url, KEEPALIVE_INTERVAL)
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        while True:
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+            try:
+                r = await client.get(url)
+                log.info("Keepalive ping  status=%d  uptime=%ss",
+                         r.status_code,
+                         r.json().get("uptime_s", "?") if r.is_success else "?")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Non-fatal — log and keep trying
+                log.warning("Keepalive ping failed: %s", exc)
+
+
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
@@ -381,19 +427,16 @@ async def _lifespan(app: FastAPI):
 
     log.info("WalkieTalk started  pid=%d", os.getpid())
 
-    # Start background zone expiry sweep
-    _expiry_task = asyncio.create_task(
-        _zone_expiry_task(), name="zone_expiry"
-    )
+    # Start background tasks
+    _expiry_task    = asyncio.create_task(_zone_expiry_task(),  name="zone_expiry")
+    _ka_task        = asyncio.create_task(_keepalive_task(),    name="keepalive")
 
     yield
 
-    # Cancel zone expiry task
-    _expiry_task.cancel()
-    try:
-        await _expiry_task
-    except asyncio.CancelledError:
-        pass
+    # Cancel background tasks
+    for _t in (_expiry_task, _ka_task):
+        _t.cancel()
+    await asyncio.gather(_expiry_task, _ka_task, return_exceptions=True)
 
     # Cancel quality tasks FIRST — before Redis closes so tasks don't hit a dead connection
     for sid, q in list(_quality.items()):

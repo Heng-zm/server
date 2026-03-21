@@ -19,17 +19,15 @@ import logging
 import os
 import re
 import time
-import statistics
 from datetime import datetime, timezone, timedelta
 from collections import deque
 from contextlib import asynccontextmanager
-from typing import Deque
 
 import httpx
 import socketio
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -68,6 +66,12 @@ _RK_RATE     = "wt:rate:"
 _RK_PRESENCE = "wt:presence"
 _USER_TTL    = 3600
 _RATE_TTL    = int(MSG_RATE_WINDOW * 2)
+
+# Pre-computed constant strings — avoids repeated str() on the hot path
+_S_MAX_MSG_RATE = str(MAX_MSG_RATE)
+_S_RATE_TTL     = str(_RATE_TTL)
+_S_MAX_ROOM     = str(MAX_ROOM_SIZE)
+_S_USER_TTL     = str(_USER_TTL)
 
 ZONE_TTL_HOURS: int = 5          # zones expire 5 hours after creation
 
@@ -156,7 +160,7 @@ _redis                           = None
 # ── Local in-memory state ──────────────────────────────────────────────────────
 _local_users:     dict[str, dict]             = {}
 _local_rooms:     dict[str, set]              = {}
-_local_msg_times: dict[str, Deque[float]]     = {}   # FIX 8: correctly typed as deque
+_local_msg_times: dict[str, deque[float]]     = {}
 
 INSTANCE_ID = f"inst_{os.getpid()}_{int(time.time()) % 10000}"
 
@@ -186,17 +190,25 @@ _quality: dict[str, dict] = {}
 def _quality_score(rtts: deque, cycles: deque) -> tuple[int, float, float, float]:
     """
     Returns (score 0-100, median_rtt_ms, drop_pct, jitter_ms).
-    Scoring weights:
-      latency  50 pts — linear decay 0→100ms=50, 100→400ms=25, 400ms+=0
-      drop     30 pts — linear decay 0%=30, 50%+=0
-      jitter   20 pts — linear decay 0→20ms=20, 20→150ms=10, 150ms+=0
+    Weights: latency 50 pts | drop 30 pts | jitter 20 pts.
+    Uses inline arithmetic — avoids statistics module overhead for small windows (≤5).
     """
     if not rtts:
         return 100, 0.0, 0.0, 0.0
 
-    median_rtt = statistics.median(rtts)
-    jitter     = statistics.stdev(rtts) if len(rtts) >= 2 else 0.0
-    drop_pct   = (cycles.count(False) / len(cycles) * 100) if cycles else 0.0
+    # Median — sort inline (window is ≤ QUALITY_RTT_WINDOW = 5)
+    s = sorted(rtts)
+    n = len(s)
+    median_rtt = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+    # Population stdev — avoids statistics.stdev() module dispatch
+    if n >= 2:
+        mean   = sum(s) / n
+        jitter = (sum((x - mean) ** 2 for x in s) / (n - 1)) ** 0.5
+    else:
+        jitter = 0.0
+
+    drop_pct = (cycles.count(False) / len(cycles) * 100) if cycles else 0.0
 
     # Latency score (50 pts)
     if median_rtt <= 100:
@@ -300,7 +312,10 @@ async def _zone_expiry_task() -> None:
                 headers={"Prefer": "return=representation"},
             )
             if r.is_success:
-                deleted = r.json() if r.text and r.text != "[]" else []
+                try:
+                    deleted = r.json() if r.text and r.text.strip() not in ("", "[]") else []
+                except Exception:
+                    deleted = []
                 if deleted:
                     log.info("Zone expiry: deleted %d expired zones", len(deleted))
                     # Broadcast all deletions concurrently — no need to wait for each
@@ -392,8 +407,10 @@ async def _lifespan(app: FastAPI):
             mine = [s for s, iid in all_presence.items() if iid == INSTANCE_ID]
             if mine:
                 await _redis.hdel(_RK_PRESENCE, *mine)
-                for sid in mine:
-                    await _redis_leave(sid, known_room=None)
+                await asyncio.gather(
+                    *[_redis_leave(sid, known_room=None) for sid in mine],
+                    return_exceptions=True,
+                )
             log.info("Shutdown cleanup: removed %d stale presences", len(mine))
         except Exception as exc:
             log.warning("Redis cleanup error: %s", exc)
@@ -455,7 +472,7 @@ async def _redis_atomic_join(sid: str, room: str, name: str) -> bool:
         _LUA_JOIN, 3,
         _RK_ROOM + room, _RK_USER + sid, _RK_PRESENCE,
         sid, room, name,
-        str(MAX_ROOM_SIZE), f"{now_ts:.3f}", INSTANCE_ID, str(_USER_TTL),
+        _S_MAX_ROOM, f"{now_ts:.3f}", INSTANCE_ID, _S_USER_TTL,
     )
     admitted = bool(result)
     if admitted:
@@ -492,6 +509,8 @@ async def _redis_room_members(room: str) -> list[dict]:
     sids = await _redis.smembers(_RK_ROOM + room)
     if not sids:
         return []
+    # Cap to MAX_ROOM_SIZE — protects against corrupted Redis state
+    sids = list(sids)[:MAX_ROOM_SIZE]
     pipe = _redis.pipeline(transaction=False)   # no MULTI/EXEC — faster for reads
     for sid in sids:
         pipe.hget(_RK_USER + sid, "name")
@@ -516,11 +535,9 @@ async def _redis_check_rate(sid: str) -> bool:
         _LUA_RATE, 1,
         key,
         f"{cutoff:.6f}", member, f"{now:.6f}",
-        str(MAX_MSG_RATE), str(_RATE_TTL),
+        _S_MAX_MSG_RATE, _S_RATE_TTL,
     )
     return bool(result)
-
-
 
 
 # ── Unified leave (local + Redis in one call) ─────────────────────────────────
@@ -550,9 +567,10 @@ async def _leave_room(sid: str) -> tuple[str | None, str]:
 # ── Local helpers ─────────────────────────────────────────────────────────────
 
 def _local_room_members(room: str) -> list[dict]:
-    snap = frozenset(_local_rooms.get(room, set()))
+    # No await in this function — safe to iterate the set directly
+    room_set = _local_rooms.get(room, ())
     return [{"sid": s, "name": _local_users[s]["name"]}
-            for s in snap if s in _local_users]
+            for s in room_set if s in _local_users]
 
 
 def _local_check_rate(sid: str) -> bool:
@@ -560,7 +578,7 @@ def _local_check_rate(sid: str) -> bool:
     cutoff = now - MSG_RATE_WINDOW
     times  = _local_msg_times.get(sid)
     if times is None:
-        times = deque()
+        times = deque(maxlen=MAX_MSG_RATE + 1)  # pre-allocate ring buffer
         _local_msg_times[sid] = times
     while times and times[0] <= cutoff:
         times.popleft()
@@ -636,7 +654,6 @@ async def get_zones(request: Request) -> JSONResponse:
         if not r.is_success:
             log.error("Supabase GET failed %s: %s", r.status_code, r.text[:200])
             return JSONResponse({"error": "upstream error", "status": r.status_code, "detail": r.text}, status_code=502)
-        from fastapi.responses import Response
         return Response(content=r.content, media_type="application/json")
     except Exception as e:
         log.exception("get_zones: %s", e)
@@ -869,7 +886,7 @@ async def voice_message(sid: str, data: dict) -> None:
         if mime not in ALLOWED_MIME:
             mime = "audio/webm"
 
-        msg_id = str(data.get("msg_id", ""))[:64]
+        msg_id = str(data.get("msg_id") or "")[:64]
         try:
             duration = min(float(data.get("duration") or 0), MAX_DURATION)
         except (TypeError, ValueError):
@@ -891,7 +908,7 @@ async def voice_message(sid: str, data: dict) -> None:
 async def quality_pong(sid: str, data: dict) -> None:
     """Client echoes quality_ping back — record RTT and mark cycle as received."""
     try:
-        nonce = str(data.get("nonce", ""))
+        nonce = str(data.get("nonce") or "")
         if not nonce:
             return
         state = _quality.get(sid)
@@ -911,8 +928,8 @@ async def quality_pong(sid: str, data: dict) -> None:
 @sio.event
 async def msg_delivered(sid: str, data: dict) -> None:
     try:
-        msg_id = str(data.get("msg_id", ""))[:64]
-        to     = str(data.get("to", ""))
+        msg_id = str(data.get("msg_id") or "")[:64]
+        to     = str(data.get("to") or "")[:128]
         if not msg_id or not to:
             return
         # Fast local check first, Redis fallback

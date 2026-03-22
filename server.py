@@ -593,6 +593,7 @@ async def _leave_room(sid: str) -> tuple[str | None, str]:
     info     = _local_users.get(sid)
     known    = info.get("room") if info else None
     name_loc = info.get("name", sid[:6]) if info else sid[:6]
+    joined   = info.get("joined_at") if info else None  # for session duration
 
     # Clean local state
     if info and known:
@@ -605,10 +606,28 @@ async def _leave_room(sid: str) -> tuple[str | None, str]:
     _local_msg_times.pop(sid, None)
 
     if _redis:
+        # Read joined_at from Redis if not in local state (cross-instance join)
+        if not joined:
+            try:
+                joined = await _redis.hget(_RK_USER + sid, "joined_at")
+            except Exception:
+                joined = None
         r_room, r_name = await _redis_leave(sid, known_room=known)
-        return r_room or known, r_name or name_loc
+        final_room = r_room or known
+        final_name = r_name or name_loc
+    else:
+        final_room = known
+        final_name = name_loc
 
-    return known, name_loc
+    # Log session duration — joined_at stored as Unix timestamp string in Redis
+    if joined and final_room:
+        try:
+            duration_s = round(time.time() - float(joined))
+            log.info("   session @%-16s  room=%-20s  duration=%ds", final_name, final_room, duration_s)
+        except (TypeError, ValueError):
+            pass
+
+    return final_room, final_name
 
 
 # ── Local helpers ─────────────────────────────────────────────────────────────
@@ -858,6 +877,9 @@ async def join_room(sid: str, data: dict) -> None:
             return
 
         await sio.enter_room(sid, room)
+        # Store joined_at in local state for session duration tracking
+        if sid in _local_users:
+            _local_users[sid]["joined_at"] = str(time.time())
 
         # Get member list (local sync fn wrapped for uniform await pattern)
         if _redis:
@@ -941,6 +963,7 @@ async def voice_message(sid: str, data: dict) -> None:
         # Rate check (Redis pipeline)
         if not await _redis_check_rate(sid):
             await sio.emit("error", {"code": "RATE_LIMITED", "msg": "Sending too fast"}, to=sid)
+            log.warning("   rate_limited @%-16s  room=%s", name, room)
             return
 
         mime = str(data.get("mime") or "audio/webm")

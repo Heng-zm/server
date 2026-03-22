@@ -989,6 +989,89 @@ async def voice_message(sid: str, data: dict) -> None:
 
 
 @sio.event
+async def voice_chunk(sid: str, data: dict) -> None:
+    """
+    Live voice streaming — relay a single audio chunk to the room immediately.
+    Uses a higher rate limit than voice_message (chunks arrive every 300ms).
+    Size limit is per-chunk: 200KB max (5s of 16kbps audio ≈ 10KB, plenty of headroom).
+    """
+    try:
+        info = _local_users.get(sid)
+        room = info.get("room") if info else None
+        if not room:
+            if _redis:
+                room = await _redis.hget(_RK_USER + sid, "room")
+            if not room:
+                return
+
+        name  = info.get("name", sid[:6]) if info else sid[:6]
+        audio = data.get("audio") or ""
+        if not audio or not isinstance(audio, str):
+            return
+
+        # Per-chunk size limit: 200KB base64 ≈ 150KB audio — more than enough per chunk
+        if len(audio) > 200_000:
+            return
+
+        # Chunk rate limit: allow up to 8 chunks/10s (vs 4 messages/10s for PTT)
+        # Re-uses the same Redis rate key but with a doubled limit for live mode
+        if _redis:
+            now    = time.time()
+            cutoff = now - MSG_RATE_WINDOW
+            key    = _RK_RATE + sid + ":live"
+            member = f"{now:.6f}"
+            result = await _redis.eval(
+                _LUA_RATE, 1, key,
+                f"{cutoff:.6f}", member, f"{now:.6f}",
+                "8", _S_RATE_TTL,   # 8 chunks per 10s window
+            )
+            if not result:
+                return  # silently drop — don't error, live stream continues
+
+        stream_id = str(data.get("stream_id") or "")[:32]
+        seq       = int(data.get("seq") or 0)
+        mime      = str(data.get("mime") or "audio/webm")
+        if mime not in ALLOWED_MIME:
+            mime = "audio/webm"
+
+        await sio.emit(
+            "voice_chunk",
+            {"audio": audio, "mime": mime, "stream_id": stream_id,
+             "seq": seq, "sender_sid": sid, "sender_name": name},
+            room=room, skip_sid=sid,
+        )
+
+    except Exception as exc:
+        log.exception("voice_chunk sid=%s: %s", sid, exc)
+
+
+@sio.event
+async def voice_stream_end(sid: str, data: dict) -> None:
+    """Signal that a live stream has ended — broadcast to room so receivers can clean up."""
+    try:
+        info = _local_users.get(sid)
+        room = info.get("room") if info else None
+        if not room:
+            if _redis:
+                room = await _redis.hget(_RK_USER + sid, "room")
+            if not room:
+                return
+
+        stream_id = str(data.get("stream_id") or "")[:32]
+        name      = info.get("name", sid[:6]) if info else sid[:6]
+
+        await sio.emit(
+            "voice_stream_end",
+            {"stream_id": stream_id, "sender_sid": sid, "sender_name": name},
+            room=room, skip_sid=sid,
+        )
+        log.info("   live_end @%-14s -> %-18s  stream=%s", name, room, stream_id[:8])
+
+    except Exception as exc:
+        log.exception("voice_stream_end sid=%s: %s", sid, exc)
+
+
+@sio.event
 async def quality_pong(sid: str, data: dict) -> None:
     """Client echoes quality_ping back — record RTT and mark cycle as received."""
     try:

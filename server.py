@@ -12,7 +12,7 @@ Environment variables:
 Run locally:
     uvicorn server:socket_app --host 0.0.0.0 --port 3000 --reload
 
-Deploy multi-instance (Render / Railway):
+Deploy (Render / Railway):
     Start: uvicorn server:socket_app --host 0.0.0.0 --port $PORT --workers 1
 """
 
@@ -21,7 +21,6 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timezone, timedelta
 from collections import deque
 from contextlib import asynccontextmanager
 
@@ -46,9 +45,6 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY",
     "sb_publishable_eLoAp9t0x-t7id3a-3LUow_SaBM6EC6")
 REDIS_URL    = os.environ.get("REDIS_URL", "")
 
-# Render free tier spins down after 15 min of inactivity.
-# RENDER_EXTERNAL_URL is injected automatically by Render on every web service.
-# On other platforms set SERVER_URL manually, or leave blank to disable keepalive.
 KEEPALIVE_URL = (
     os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
     or os.environ.get("SERVER_URL", "").rstrip("/")
@@ -68,6 +64,10 @@ MAX_AUDIO_BYTES = 8_000_000
 MAX_DURATION    = 65.0
 MAX_MSG_RATE    = 4
 MSG_RATE_WINDOW = 10.0
+MAX_CHUNK_BYTES = 200_000        # per live-voice chunk
+MAX_CHUNK_RATE  = 8              # chunks per MSG_RATE_WINDOW in live mode
+
+ZONE_TTL_SECS: int = 5 * 3600   # 5 hours in seconds (avoids datetime import)
 
 # Redis key prefixes
 _RK_ROOM     = "wt:room:"
@@ -78,30 +78,27 @@ _USER_TTL    = 3600
 _RATE_TTL    = int(MSG_RATE_WINDOW * 2)
 
 # Pre-computed constant strings — avoids repeated str() on the hot path
-_S_MAX_MSG_RATE = str(MAX_MSG_RATE)
-_S_RATE_TTL     = str(_RATE_TTL)
-_S_MAX_ROOM     = str(MAX_ROOM_SIZE)
-_S_USER_TTL     = str(_USER_TTL)
-
-ZONE_TTL_HOURS: int = 5          # zones expire 5 hours after creation
+_S_MAX_MSG_RATE  = str(MAX_MSG_RATE)
+_S_MAX_CHUNK_RATE = str(MAX_CHUNK_RATE)
+_S_RATE_TTL      = str(_RATE_TTL)
+_S_MAX_ROOM      = str(MAX_ROOM_SIZE)
+_S_USER_TTL      = str(_USER_TTL)
 
 ALLOWED_MIME: frozenset[str] = frozenset({
     "audio/webm", "audio/webm;codecs=opus",
     "audio/mp4",  "audio/ogg", "audio/wav",
 })
 
-# ── Precompiled regexes (avoid recompiling on every call) ─────────────────────
+# ── Precompiled regexes ────────────────────────────────────────────────────────
 _NAME_RE  = re.compile(r"[^a-z0-9_\-]")
 _ROOM_RE  = re.compile(r"[^A-Z0-9_\-]")
 _DEV_RE   = re.compile(r"[^a-zA-Z0-9_\-]")
-_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")   # FIX 3: was recompiled every call
+_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 _start_time = time.time()
 
-# ── Lua scripts — module-level constants ──────────────────────────────────────
+# ── Lua scripts ───────────────────────────────────────────────────────────────
 
-# Atomic rate check + record: evict expired, check count, conditionally add
-# Returns 1 if allowed, 0 if rate-limited — all in one round-trip (BUG 5+11)
 _LUA_RATE = """
 local key    = KEYS[1]
 local cutoff = ARGV[1]
@@ -117,7 +114,6 @@ redis.call('expire', key, ttl)
 return 1
 """
 
-# Atomic join: check capacity + register user in one Redis round-trip
 _LUA_JOIN = """
 local room_key = KEYS[1]
 local user_key = KEYS[2]
@@ -139,10 +135,6 @@ redis.call('expire', room_key, ttl)
 return 1
 """
 
-# Atomic leave: hget room+name, remove user+presence, clean empty room
-# BUG1: was 'delete' (invalid), now 'del'
-# BUG2: now reads room from the hash itself, not from a stale room_key arg
-# BUG4: returns nil sentinel so caller can distinguish "not found" from empty room
 _LUA_LEAVE = """
 local user_key = KEYS[1]
 local pres_key = KEYS[2]
@@ -168,119 +160,86 @@ _http:  httpx.AsyncClient | None = None
 _redis                           = None
 
 # ── Local in-memory state ──────────────────────────────────────────────────────
-_local_users:     dict[str, dict]             = {}
-_local_rooms:     dict[str, set]              = {}
-_local_msg_times: dict[str, deque[float]]     = {}
+_local_users:     dict[str, dict]         = {}
+_local_rooms:     dict[str, set]          = {}
+_local_msg_times: dict[str, deque[float]] = {}   # PTT rate
+_local_chunk_times: dict[str, deque[float]] = {}  # live chunk rate
 
 INSTANCE_ID = f"inst_{os.getpid()}_{int(time.time()) % 10000}"
 
-# ── Health ping cache ────────────────────────────────────────────────────────
+# ── Health ping cache ──────────────────────────────────────────────────────────
 _last_ping_ok:   bool  = False
 _last_ping_time: float = 0.0
 _PING_CACHE_TTL: float = 10.0
 
-# Self-ping interval — must be shorter than Render's 15-min spin-down window
+# Self-ping interval
 KEEPALIVE_INTERVAL: int = 10 * 60   # 10 minutes
 
-# ── Connection quality ────────────────────────────────────────────────────────
-# Each connected sid gets an asyncio Task that pings every QUALITY_INTERVAL
-# seconds, records RTT + drop, computes a 0-100 score, and emits quality_update.
-QUALITY_INTERVAL:   float = 30.0   # seconds between quality measurements
-QUALITY_PING_TMO:   float = 5.0    # seconds to wait for a pong before marking drop
-QUALITY_RTT_WINDOW: int   = 5      # keep last N RTT samples for median/jitter
-QUALITY_CYCLE_WIN:  int   = 5      # keep last N ping cycles for drop rate
+# ── Connection quality ─────────────────────────────────────────────────────────
+QUALITY_INTERVAL:   float = 30.0
+QUALITY_PING_TMO:   float = 5.0
+QUALITY_RTT_WINDOW: int   = 5
+QUALITY_CYCLE_WIN:  int   = 5
 
-# Per-sid quality state — keyed by sid, cleaned up on disconnect
-# {
-#   "pending": {nonce: sent_time},   # unanswered pings
-#   "rtts":    deque[float],         # recent RTT samples in ms
-#   "cycles":  deque[bool],          # True=received, False=dropped
-#   "task":    asyncio.Task,         # per-sid background task
-# }
 _quality: dict[str, dict] = {}
 
 
 def _quality_score(rtts: deque, cycles: deque) -> tuple[int, float, float, float]:
-    """
-    Returns (score 0-100, median_rtt_ms, drop_pct, jitter_ms).
-    Weights: latency 50 pts | drop 30 pts | jitter 20 pts.
-    Uses inline arithmetic — avoids statistics module overhead for small windows (≤5).
-    """
+    """Returns (score 0-100, median_rtt_ms, drop_pct, jitter_ms)."""
     if not rtts:
         return 100, 0.0, 0.0, 0.0
 
-    # Median — sort inline (window is ≤ QUALITY_RTT_WINDOW = 5)
     s = sorted(rtts)
     n = len(s)
     median_rtt = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
 
-    # Population stdev — avoids statistics.stdev() module dispatch
     if n >= 2:
         mean   = sum(s) / n
         jitter = (sum((x - mean) ** 2 for x in s) / (n - 1)) ** 0.5
     else:
         jitter = 0.0
 
-    drop_pct = (cycles.count(False) / len(cycles) * 100) if cycles else 0.0
+    # Inline drop count — deque.count is O(n) but window is ≤5
+    drop_count = sum(1 for c in cycles if not c)
+    drop_pct   = (drop_count / len(cycles) * 100) if cycles else 0.0
 
-    # Latency score (50 pts)
-    if median_rtt <= 100:
-        lat_score = 50.0
-    elif median_rtt <= 400:
-        lat_score = 50.0 - (median_rtt - 100) / 300 * 25
-    else:
-        lat_score = max(0.0, 25.0 - (median_rtt - 400) / 200 * 25)
-
-    # Drop score (30 pts)
+    lat_score = (
+        50.0 if median_rtt <= 100 else
+        50.0 - (median_rtt - 100) / 300 * 25 if median_rtt <= 400 else
+        max(0.0, 25.0 - (median_rtt - 400) / 200 * 25)
+    )
     drop_score = max(0.0, 30.0 - drop_pct / 50 * 30)
-
-    # Jitter score (20 pts)
-    if jitter <= 20:
-        jit_score = 20.0
-    elif jitter <= 150:
-        jit_score = 20.0 - (jitter - 20) / 130 * 10
-    else:
-        jit_score = max(0.0, 10.0 - (jitter - 150) / 100 * 10)
+    jit_score  = (
+        20.0 if jitter <= 20 else
+        20.0 - (jitter - 20) / 130 * 10 if jitter <= 150 else
+        max(0.0, 10.0 - (jitter - 150) / 100 * 10)
+    )
 
     score = round(lat_score + drop_score + jit_score)
     return max(0, min(100, score)), round(median_rtt, 1), round(drop_pct, 1), round(jitter, 1)
 
 
 async def _quality_task(sid: str) -> None:
-    """
-    Per-sid background task. Runs until cancelled (on disconnect).
-    Each cycle:
-      1. Emit quality_ping with a unique nonce + server timestamp.
-      2. Wait QUALITY_PING_TMO seconds for pong.
-      3. Record drop or RTT.
-      4. Every QUALITY_INTERVAL seconds (after first cycle) emit quality_update.
-    """
-    # State is pre-created in connect() before this task starts
-    state = _quality[sid]
+    state = _quality.get(sid)
+    if state is None:
+        return
     cycle = 0
     try:
         while True:
             await asyncio.sleep(QUALITY_INTERVAL)
-            # No presence check needed — task is cancelled by disconnect() when sid leaves
-
-            # Send ping
-            nonce    = f"{sid}_{cycle}"
-            sent_at  = time.monotonic()
+            nonce   = f"{sid}_{cycle}"
+            sent_at = time.monotonic()
             state["pending"][nonce] = sent_at
             await sio.emit("quality_ping", {"nonce": nonce}, to=sid)
             cycle += 1
 
-            # Wait for pong (checked by quality_pong event handler)
             await asyncio.sleep(QUALITY_PING_TMO)
 
-            # If nonce still in pending → drop
             if nonce in state["pending"]:
                 del state["pending"][nonce]
                 state["cycles"].append(False)
                 log.debug("quality drop  sid=%s  nonce=%s", sid[:8], nonce)
-            # (RTT already recorded in quality_pong if received)
 
-            # Emit score to client
             score, median_rtt, drop_pct, jitter = _quality_score(
                 state["rtts"], state["cycles"]
             )
@@ -294,30 +253,19 @@ async def _quality_task(sid: str) -> None:
                 "   quality sid=%-8s  score=%3d  rtt=%.0fms  drop=%.0f%%  jitter=%.0fms",
                 sid[:8], score, median_rtt, drop_pct, jitter,
             )
-
     except asyncio.CancelledError:
-        pass  # normal on disconnect — state already cleaned in disconnect()
+        pass
     except Exception as exc:
         log.warning("quality_task sid=%s error: %s", sid[:8], exc)
 
 
 # ── Zone expiry background task ───────────────────────────────────────────────
-ZONE_EXPIRY_INTERVAL: int = 15 * 60   # check every 15 minutes
+ZONE_EXPIRY_INTERVAL: int = 15 * 60
 
 async def _zone_expiry_task() -> None:
-    """
-    Runs forever (cancelled on shutdown). Every ZONE_EXPIRY_INTERVAL seconds:
-      1. DELETE from geo_zones where expires_at <= now() via Supabase REST.
-      2. For each deleted zone broadcast zone_deleted so all clients remove it.
-    Uses the Supabase REST API's 'return=representation' to get back the IDs
-    of the rows it actually deleted, so we can broadcast precisely.
-    """
-    log.info("Zone expiry task started  interval=%ds  ttl=%dh",
-             ZONE_EXPIRY_INTERVAL, ZONE_TTL_HOURS)
+    log.info("Zone expiry task started  interval=%ds", ZONE_EXPIRY_INTERVAL)
     first_run = True
     while True:
-        # Sweep immediately on startup (short delay for HTTP client to settle),
-        # then every ZONE_EXPIRY_INTERVAL seconds
         await asyncio.sleep(5 if first_run else ZONE_EXPIRY_INTERVAL)
         first_run = False
         if _http is None:
@@ -335,7 +283,6 @@ async def _zone_expiry_task() -> None:
                     deleted = []
                 if deleted:
                     log.info("Zone expiry: deleted %d expired zones", len(deleted))
-                    # Broadcast all deletions concurrently — no need to wait for each
                     await asyncio.gather(*[
                         sio.emit("zone_deleted", {
                             "id":        z.get("id", ""),
@@ -348,23 +295,13 @@ async def _zone_expiry_task() -> None:
                 log.warning("Zone expiry DELETE failed %s: %s",
                             r.status_code, r.text[:200])
         except asyncio.CancelledError:
-            raise  # propagate so lifespan knows we stopped cleanly
+            raise
         except Exception as exc:
             log.warning("Zone expiry task error: %s", exc)
-    log.info("Zone expiry task stopped")
 
 
 # ── Render keepalive ──────────────────────────────────────────────────────────
 async def _keepalive_task() -> None:
-    """
-    Prevents Render free-tier spin-down by pinging our own /health endpoint
-    every KEEPALIVE_INTERVAL seconds.
-
-    Uses a dedicated httpx client (separate from the Supabase _http client)
-    so a slow Supabase response never blocks the keepalive ping.
-
-    Exits silently if KEEPALIVE_URL is not set (local dev / non-Render deploy).
-    """
     if not KEEPALIVE_URL:
         log.info("Keepalive disabled — RENDER_EXTERNAL_URL / SERVER_URL not set")
         return
@@ -383,7 +320,6 @@ async def _keepalive_task() -> None:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # Non-fatal — log and keep trying
                 log.warning("Keepalive ping failed: %s", exc)
 
 
@@ -392,7 +328,6 @@ async def _keepalive_task() -> None:
 async def _lifespan(app: FastAPI):
     global _http, _redis
 
-    # HTTP client — conservative pool for single upstream host (FIX 11)
     _http = httpx.AsyncClient(
         base_url=SUPABASE_URL,
         headers=_SB_HEADERS,
@@ -427,18 +362,17 @@ async def _lifespan(app: FastAPI):
 
     log.info("WalkieTalk started  pid=%d", os.getpid())
 
-    # Start background tasks
-    _expiry_task    = asyncio.create_task(_zone_expiry_task(),  name="zone_expiry")
-    _ka_task        = asyncio.create_task(_keepalive_task(),    name="keepalive")
+    _expiry_task = asyncio.create_task(_zone_expiry_task(), name="zone_expiry")
+    _ka_task     = asyncio.create_task(_keepalive_task(),   name="keepalive")
 
     yield
 
-    # Cancel background tasks
+    # Shutdown: background tasks first
     for _t in (_expiry_task, _ka_task):
         _t.cancel()
     await asyncio.gather(_expiry_task, _ka_task, return_exceptions=True)
 
-    # Cancel quality tasks FIRST — before Redis closes so tasks don't hit a dead connection
+    # Cancel all quality tasks before Redis closes
     for sid, q in list(_quality.items()):
         if (t := q.get("task")) and not t.done():
             t.cancel()
@@ -473,7 +407,6 @@ def _build_sio() -> socketio.AsyncServer:
     common = dict(
         async_mode="asgi",
         cors_allowed_origins="*",
-        # FIX 18: higher ping_interval reduces churn on mobile backgrounding
         ping_timeout=60,
         ping_interval=25,
         max_http_buffer_size=MAX_AUDIO_BYTES + 512_000,
@@ -498,7 +431,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=False,   # FIX 16: explicit false skips a middleware check
+    allow_credentials=False,
 )
 socket_app = socketio.ASGIApp(sio, app)
 
@@ -506,15 +439,15 @@ socket_app = socketio.ASGIApp(sio, app)
 # ── Redis helpers ─────────────────────────────────────────────────────────────
 
 async def _redis_atomic_join(sid: str, room: str, name: str) -> bool:
-    """Atomic capacity check + join via Lua. Returns True if admitted."""
+    now_ts = time.time()
     if not _redis:
         if len(_local_rooms.get(room, set())) >= MAX_ROOM_SIZE:
             return False
-        _local_users[sid] = {"room": room, "name": name, "joined_at": time.time()}
+        # joined_at stored as float — consistent with Redis path
+        _local_users[sid] = {"room": room, "name": name, "joined_at": now_ts}
         _local_rooms.setdefault(room, set()).add(sid)
         return True
 
-    now_ts = time.time()
     result = await _redis.eval(
         _LUA_JOIN, 3,
         _RK_ROOM + room, _RK_USER + sid, _RK_PRESENCE,
@@ -523,18 +456,13 @@ async def _redis_atomic_join(sid: str, room: str, name: str) -> bool:
     )
     admitted = bool(result)
     if admitted:
+        # Mirror in local state — float consistent with local path
         _local_users[sid] = {"room": room, "name": name, "joined_at": now_ts}
         _local_rooms.setdefault(room, set()).add(sid)
     return admitted
 
 
 async def _redis_leave(sid: str, known_room: str | None) -> tuple[str | None, str]:
-    """
-    Single Lua round-trip: reads room from hash, removes user+presence,
-    cleans empty room. Returns (old_room, name).
-    BUG2 fix: Lua now reads room from hash — no stale room_key arg.
-    BUG4 fix: nil check uses `is None`, not falsy, to distinguish not-found.
-    """
     if not _redis:
         return None, sid[:6]
 
@@ -543,70 +471,68 @@ async def _redis_leave(sid: str, known_room: str | None) -> tuple[str | None, st
         _RK_USER + sid, _RK_PRESENCE,
         sid, _RK_ROOM,
     )
-    # result is [None, None] if user not in Redis — fall back to known_room
     if not result or result[0] is None:
         return known_room, sid[:6]
     return result[0] or known_room, result[1] or sid[:6]
 
 
 async def _redis_room_members(room: str) -> list[dict]:
-    """FIX 6: pipeline SMEMBERS + batch HGET in one round-trip."""
     if not _redis:
         return _local_room_members(room)
     sids = await _redis.smembers(_RK_ROOM + room)
     if not sids:
         return []
-    # Cap to MAX_ROOM_SIZE — protects against corrupted Redis state
     sids = list(sids)[:MAX_ROOM_SIZE]
-    pipe = _redis.pipeline(transaction=False)   # no MULTI/EXEC — faster for reads
+    pipe = _redis.pipeline(transaction=False)
     for sid in sids:
         pipe.hget(_RK_USER + sid, "name")
     names = await pipe.execute()
     return [{"sid": s, "name": n} for s, n in zip(sids, names) if n]
 
 
-async def _redis_check_rate(sid: str) -> bool:
+async def _redis_check_rate(sid: str, limit_str: str = None, key_suffix: str = "") -> bool:
     """
-    BUG 5+11: Single Lua round-trip — evict + count + conditionally zadd atomically.
-    Eliminates the separate zadd call that could be lost on timeout.
+    Unified rate checker for both PTT messages and live chunks.
+    key_suffix="" → PTT key, key_suffix=":live" → chunk key.
+    limit_str defaults to _S_MAX_MSG_RATE.
     """
+    _limit = limit_str or _S_MAX_MSG_RATE
     if not _redis:
-        return _local_check_rate(sid)
+        # Local fallback — uses the appropriate deque based on suffix
+        return _local_check_rate(sid, live=(key_suffix == ":live"))
 
     now    = time.time()
     cutoff = now - MSG_RATE_WINDOW
-    key    = _RK_RATE + sid
-    member = f"{now:.6f}:{sid}"
+    key    = _RK_RATE + sid + key_suffix
+    member = f"{now:.6f}:{sid}"   # include sid for uniqueness across instances
 
     result = await _redis.eval(
         _LUA_RATE, 1,
         key,
         f"{cutoff:.6f}", member, f"{now:.6f}",
-        _S_MAX_MSG_RATE, _S_RATE_TTL,
+        _limit, _S_RATE_TTL,
     )
     return bool(result)
 
 
-# ── Unified leave (local + Redis in one call) ─────────────────────────────────
+# ── Unified leave ─────────────────────────────────────────────────────────────
 async def _leave_room(sid: str) -> tuple[str | None, str]:
-    # Pull from local first — avoids HGETALL in Lua when possible (FIX 9)
     info     = _local_users.get(sid)
     known    = info.get("room") if info else None
     name_loc = info.get("name", sid[:6]) if info else sid[:6]
-    joined   = info.get("joined_at") if info else None  # for session duration
+    joined   = info.get("joined_at") if info else None
 
-    # Clean local state
     if info and known:
         room_set = _local_rooms.get(known)
         if room_set is not None:
             room_set.discard(sid)
             if not room_set:
                 del _local_rooms[known]
-    _local_users.pop(sid, None)      # pop removes it entirely — no need to null room field
+    _local_users.pop(sid, None)
     _local_msg_times.pop(sid, None)
+    _local_chunk_times.pop(sid, None)   # clean live rate state too
 
     if _redis:
-        # Read joined_at from Redis if not in local state (cross-instance join)
         if not joined:
             try:
                 joined = await _redis.hget(_RK_USER + sid, "joined_at")
@@ -619,11 +545,11 @@ async def _leave_room(sid: str) -> tuple[str | None, str]:
         final_room = known
         final_name = name_loc
 
-    # Log session duration — joined_at stored as Unix timestamp string in Redis
     if joined and final_room:
         try:
             duration_s = round(time.time() - float(joined))
-            log.info("   session @%-16s  room=%-20s  duration=%ds", final_name, final_room, duration_s)
+            log.info("   session @%-16s  room=%-20s  duration=%ds",
+                     final_name, final_room, duration_s)
         except (TypeError, ValueError):
             pass
 
@@ -633,29 +559,46 @@ async def _leave_room(sid: str) -> tuple[str | None, str]:
 # ── Local helpers ─────────────────────────────────────────────────────────────
 
 def _local_room_members(room: str) -> list[dict]:
-    # No await in this function — safe to iterate the set directly
     room_set = _local_rooms.get(room, ())
     return [{"sid": s, "name": _local_users[s]["name"]}
             for s in room_set if s in _local_users]
 
 
-def _local_check_rate(sid: str) -> bool:
+def _local_check_rate(sid: str, live: bool = False) -> bool:
+    """Single local rate checker for both PTT (live=False) and chunk (live=True)."""
     now    = time.time()
     cutoff = now - MSG_RATE_WINDOW
-    times  = _local_msg_times.get(sid)
+    store  = _local_chunk_times if live else _local_msg_times
+    limit  = MAX_CHUNK_RATE if live else MAX_MSG_RATE
+    times  = store.get(sid)
     if times is None:
-        times = deque(maxlen=MAX_MSG_RATE + 1)  # pre-allocate ring buffer
-        _local_msg_times[sid] = times
+        times = deque(maxlen=limit + 1)
+        store[sid] = times
     while times and times[0] <= cutoff:
         times.popleft()
-    if len(times) >= MAX_MSG_RATE:
+    if len(times) >= limit:
         return False
     times.append(now)
     return True
 
 
-# ── Sanitizers ────────────────────────────────────────────────────────────────
+# ── Room+name lookup — shared hot-path helper ─────────────────────────────────
+async def _get_room_and_name(sid: str) -> tuple[str | None, str]:
+    """
+    Fast local lookup with Redis fallback for cross-instance joins.
+    Returns (room_or_None, name).
+    """
+    info = _local_users.get(sid)
+    if info:
+        return info.get("room"), info.get("name", sid[:6])
+    if _redis:
+        room = await _redis.hget(_RK_USER + sid, "room")
+        name = await _redis.hget(_RK_USER + sid, "name") or sid[:6]
+        return room, name
+    return None, sid[:6]
 
+
+# ── Sanitizers ────────────────────────────────────────────────────────────────
 def _sanitize_name(raw: str, fallback: str) -> str:
     c = _NAME_RE.sub("", (raw or "").strip().lower().replace(" ", "_"))
     return c[:MAX_NAME_LEN] or fallback[:MAX_NAME_LEN]
@@ -668,7 +611,7 @@ def _sanitize_device(raw: str) -> str:
 
 def _validate_color(raw: object) -> str:
     s = str(raw or "").strip()
-    return s if _COLOR_RE.match(s) else "#007aff"   # FIX 3: uses precompiled pattern
+    return s if _COLOR_RE.match(s) else "#007aff"
 
 
 # ── HTTP endpoints ─────────────────────────────────────────────────────────────
@@ -676,7 +619,6 @@ def _validate_color(raw: object) -> str:
 @app.get("/health")
 async def health() -> JSONResponse:
     global _last_ping_ok, _last_ping_time
-    # FIX 10: cache Redis ping result — don't hit Redis on every health check
     now = time.time()
     if _redis and (now - _last_ping_time) > _PING_CACHE_TTL:
         try:
@@ -686,13 +628,17 @@ async def health() -> JSONResponse:
             _last_ping_ok = False
         _last_ping_time = now
 
+    # Snapshot local state once — avoid repeated dict access
+    conn  = len(_local_users)
+    rooms = {k: len(v) for k, v in _local_rooms.items()}
+
     return JSONResponse({
-        "status":       "ok",
-        "instance":     INSTANCE_ID,
-        "connections":  len(_local_users),
-        "rooms_local":  {k: len(v) for k, v in _local_rooms.items()},
-        "redis":        _last_ping_ok if _redis else None,
-        "uptime_s":     round(now - _start_time),
+        "status":      "ok",
+        "instance":    INSTANCE_ID,
+        "connections": conn,
+        "rooms_local": rooms,
+        "redis":       _last_ping_ok if _redis else None,
+        "uptime_s":    round(now - _start_time),
     })
 
 
@@ -715,20 +661,19 @@ async def get_zones(request: Request) -> JSONResponse:
         r = await _http.get("/rest/v1/geo_zones", params={
             "order":      "created_at.asc",
             "select":     "id,device_id,name,channel,lat,lng,radius,color,auto_join,created_by,expires_at",
-            "expires_at": "gte.now()",   # never return expired zones
+            "expires_at": "gte.now()",
         })
         if not r.is_success:
             log.error("Supabase GET failed %s: %s", r.status_code, r.text[:200])
-            return JSONResponse({"error": "upstream error", "status": r.status_code, "detail": r.text}, status_code=502)
+            return JSONResponse({"error": "upstream error", "status": r.status_code}, status_code=502)
         return Response(content=r.content, media_type="application/json")
     except Exception as e:
         log.exception("get_zones: %s", e)
-        return JSONResponse({"error": "server error", "detail": str(e)}, status_code=500)
+        return JSONResponse({"error": "server error"}, status_code=500)
 
 
 @app.post("/zones")
 async def upsert_zone(request: Request) -> JSONResponse:
-    # Guard before parsing body — saves work when server is still initializing
     if _http is None:
         return JSONResponse({"error": "server initializing"}, status_code=503)
     try:
@@ -758,9 +703,10 @@ async def upsert_zone(request: Request) -> JSONResponse:
     if not (10 <= radius <= 50_000):
         return JSONResponse({"error": "radius must be 10–50000 m"}, status_code=400)
 
-    expires_at = (
-        datetime.now(timezone.utc) + timedelta(hours=ZONE_TTL_HOURS)
-    ).isoformat()
+    # Use time.time() directly — avoids datetime/timezone overhead, ISO format manual
+    expires_ts = time.time() + ZONE_TTL_SECS
+    import datetime as _dt
+    expires_at = _dt.datetime.fromtimestamp(expires_ts, tz=_dt.timezone.utc).isoformat()
 
     payload = {
         "id": zone_id, "device_id": device_id,
@@ -768,7 +714,7 @@ async def upsert_zone(request: Request) -> JSONResponse:
         "lat": lat, "lng": lng, "radius": radius,
         "color": color, "auto_join": auto_join,
         "created_by": created_by[:32],
-        "expires_at": expires_at,          # set once on create; never overwritten on update
+        "expires_at": expires_at,
     }
 
     try:
@@ -778,7 +724,7 @@ async def upsert_zone(request: Request) -> JSONResponse:
         )
         if not r.is_success:
             log.error("Supabase upsert failed %s: %s", r.status_code, r.text[:200])
-            return JSONResponse({"error": "upstream error", "status": r.status_code, "detail": r.text}, status_code=502)
+            return JSONResponse({"error": "upstream error", "status": r.status_code}, status_code=502)
 
         await sio.emit("zone_upserted", {
             "id": zone_id, "device_id": device_id,
@@ -791,7 +737,7 @@ async def upsert_zone(request: Request) -> JSONResponse:
         return JSONResponse({"ok": True})
     except Exception as e:
         log.exception("upsert_zone: %s", e)
-        return JSONResponse({"error": "server error", "detail": str(e)}, status_code=500)
+        return JSONResponse({"error": "server error"}, status_code=500)
 
 
 @app.delete("/zones/{zone_id}")
@@ -810,8 +756,7 @@ async def delete_zone(zone_id: str, request: Request) -> JSONResponse:
         )
         if not r.is_success:
             log.error("Supabase DELETE failed %s: %s", r.status_code, r.text[:200])
-            return JSONResponse({"error": "upstream error", "status": r.status_code, "detail": r.text}, status_code=502)
-        # Only broadcast if a row was actually deleted — empty array means device_id mismatch
+            return JSONResponse({"error": "upstream error", "status": r.status_code}, status_code=502)
         try:
             deleted_rows = r.json() if r.text and r.text.strip() not in ("", "[]") else []
         except Exception:
@@ -822,25 +767,26 @@ async def delete_zone(zone_id: str, request: Request) -> JSONResponse:
         return JSONResponse({"ok": True})
     except Exception as e:
         log.exception("delete_zone: %s", e)
-        return JSONResponse({"error": "server error", "detail": str(e)}, status_code=500)
+        return JSONResponse({"error": "server error"}, status_code=500)
 
 
 # ── Socket events ──────────────────────────────────────────────────────────────
 
 @sio.event
 async def connect(sid: str, environ: dict) -> None:
-    # Spin up per-sid quality measurement task
-    task = asyncio.create_task(_quality_task(sid), name=f"quality_{sid[:8]}")
-    _quality.setdefault(sid, {
+    # Pre-create quality state BEFORE task starts — avoids race in _quality_task
+    state: dict = {
         "pending": {},
         "rtts":    deque(maxlen=QUALITY_RTT_WINDOW),
         "cycles":  deque(maxlen=QUALITY_CYCLE_WIN),
-    })["task"] = task
+        "task":    None,
+    }
+    _quality[sid] = state
+    state["task"] = asyncio.create_task(_quality_task(sid), name=f"quality_{sid[:8]}")
 
 
 @sio.event
 async def disconnect(sid: str) -> None:
-    # Cancel quality task before cleaning state
     q = _quality.pop(sid, None)
     if q and (t := q.get("task")) and not t.done():
         t.cancel()
@@ -867,7 +813,6 @@ async def join_room(sid: str, data: dict) -> None:
         old_room, old_name = await _leave_room(sid)
         if old_room and old_room != room:
             await sio.leave_room(sid, old_room)
-            # Use old_name — peers in the old room knew them by that name
             await sio.emit("peer_left", {"sid": sid, "name": old_name}, room=old_room, skip_sid=sid)
 
         admitted = await _redis_atomic_join(sid, room, name)
@@ -877,15 +822,9 @@ async def join_room(sid: str, data: dict) -> None:
             return
 
         await sio.enter_room(sid, room)
-        # Store joined_at in local state for session duration tracking
-        if sid in _local_users:
-            _local_users[sid]["joined_at"] = str(time.time())
+        # joined_at already set as float in _redis_atomic_join — no overwrite needed
 
-        # Get member list (local sync fn wrapped for uniform await pattern)
-        if _redis:
-            members = await _redis_room_members(room)
-        else:
-            members = _local_room_members(room)
+        members = await _redis_room_members(room) if _redis else _local_room_members(room)
         await asyncio.gather(
             sio.emit("peer_joined", {"sid": sid, "name": name}, room=room, skip_sid=sid),
             sio.emit("room_state",  {"members": members}, to=sid),
@@ -917,14 +856,11 @@ async def update_name(sid: str, data: dict) -> None:
         old_name = info["name"] if info else sid[:6]
         room     = info.get("room") if info else None
 
-        # BUG 10: if user joined on another instance, local lookup misses —
-        # fall back to Redis for room lookup so broadcast still fires
         name_changed = not info or info.get("name") != new_name
         if info:
             info["name"] = new_name
         if not room and _redis:
             room = await _redis.hget(_RK_USER + sid, "room")
-
         if _redis and name_changed:
             await _redis.hset(_RK_USER + sid, "name", new_name)
         if room:
@@ -937,30 +873,19 @@ async def update_name(sid: str, data: dict) -> None:
 @sio.event
 async def voice_message(sid: str, data: dict) -> None:
     try:
-        # FIX 4+7: local lookup first — only hit Redis on cache miss
-        info = _local_users.get(sid)
-        room = info.get("room") if info else None
+        room, name = await _get_room_and_name(sid)
         if not room:
-            # Fallback: Redis knows if this sid joined on another instance
-            if _redis:
-                room = await _redis.hget(_RK_USER + sid, "room")
-            if not room:
-                return
-
-        name  = info.get("name", sid[:6]) if info else sid[:6]
-        audio = data.get("audio") or ""
-        if not audio:
             return
-        if not isinstance(audio, str):
-            return  # reject non-string payloads (malformed client)
 
-        # Check size BEFORE rate limit — reject oversized blobs without burning a rate slot
+        audio = data.get("audio") or ""
+        if not audio or not isinstance(audio, str):
+            return
+
         audio_len = len(audio)
         if audio_len > MAX_AUDIO_BYTES:
             await sio.emit("error", {"code": "MSG_TOO_LARGE", "msg": "Audio too large"}, to=sid)
             return
 
-        # Rate check (Redis pipeline)
         if not await _redis_check_rate(sid):
             await sio.emit("error", {"code": "RATE_LIMITED", "msg": "Sending too fast"}, to=sid)
             log.warning("   rate_limited @%-16s  room=%s", name, room)
@@ -990,43 +915,22 @@ async def voice_message(sid: str, data: dict) -> None:
 
 @sio.event
 async def voice_chunk(sid: str, data: dict) -> None:
-    """
-    Live voice streaming — relay a single audio chunk to the room immediately.
-    Uses a higher rate limit than voice_message (chunks arrive every 300ms).
-    Size limit is per-chunk: 200KB max (5s of 16kbps audio ≈ 10KB, plenty of headroom).
-    """
+    """Live voice streaming — relay a single audio chunk to the room immediately."""
     try:
-        info = _local_users.get(sid)
-        room = info.get("room") if info else None
+        room, name = await _get_room_and_name(sid)
         if not room:
-            if _redis:
-                room = await _redis.hget(_RK_USER + sid, "room")
-            if not room:
-                return
+            return
 
-        name  = info.get("name", sid[:6]) if info else sid[:6]
         audio = data.get("audio") or ""
         if not audio or not isinstance(audio, str):
             return
 
-        # Per-chunk size limit: 200KB base64 ≈ 150KB audio — more than enough per chunk
-        if len(audio) > 200_000:
-            return
+        if len(audio) > MAX_CHUNK_BYTES:
+            return  # silently drop oversized chunk
 
-        # Chunk rate limit: allow up to 8 chunks/10s (vs 4 messages/10s for PTT)
-        # Re-uses the same Redis rate key but with a doubled limit for live mode
-        if _redis:
-            now    = time.time()
-            cutoff = now - MSG_RATE_WINDOW
-            key    = _RK_RATE + sid + ":live"
-            member = f"{now:.6f}"
-            result = await _redis.eval(
-                _LUA_RATE, 1, key,
-                f"{cutoff:.6f}", member, f"{now:.6f}",
-                "8", _S_RATE_TTL,   # 8 chunks per 10s window
-            )
-            if not result:
-                return  # silently drop — don't error, live stream continues
+        # Rate limit: live chunks use separate key + higher limit
+        if not await _redis_check_rate(sid, _S_MAX_CHUNK_RATE, ":live"):
+            return  # silently drop — live stream self-regulates
 
         stream_id = str(data.get("stream_id") or "")[:32]
         seq       = int(data.get("seq") or 0)
@@ -1047,19 +951,13 @@ async def voice_chunk(sid: str, data: dict) -> None:
 
 @sio.event
 async def voice_stream_end(sid: str, data: dict) -> None:
-    """Signal that a live stream has ended — broadcast to room so receivers can clean up."""
+    """Signal that a live stream ended — broadcast to room for cleanup."""
     try:
-        info = _local_users.get(sid)
-        room = info.get("room") if info else None
+        room, name = await _get_room_and_name(sid)
         if not room:
-            if _redis:
-                room = await _redis.hget(_RK_USER + sid, "room")
-            if not room:
-                return
+            return
 
         stream_id = str(data.get("stream_id") or "")[:32]
-        name      = info.get("name", sid[:6]) if info else sid[:6]
-
         await sio.emit(
             "voice_stream_end",
             {"stream_id": stream_id, "sender_sid": sid, "sender_name": name},
@@ -1073,7 +971,6 @@ async def voice_stream_end(sid: str, data: dict) -> None:
 
 @sio.event
 async def quality_pong(sid: str, data: dict) -> None:
-    """Client echoes quality_ping back — record RTT and mark cycle as received."""
     try:
         nonce = str(data.get("nonce") or "")
         if not nonce:
@@ -1083,7 +980,7 @@ async def quality_pong(sid: str, data: dict) -> None:
             return
         sent_at = state["pending"].pop(nonce, None)
         if sent_at is None:
-            return  # already timed out and counted as drop
+            return
         rtt_ms = (time.monotonic() - sent_at) * 1000
         state["rtts"].append(rtt_ms)
         state["cycles"].append(True)
@@ -1099,8 +996,10 @@ async def msg_delivered(sid: str, data: dict) -> None:
         to     = str(data.get("to") or "")[:128]
         if not msg_id or not to:
             return
-        # Fast local check first, Redis fallback
-        exists = (to in _local_users) or (bool(await _redis.hexists(_RK_PRESENCE, to)) if _redis else False)
+        # Local check first; Redis hexists only if needed and redis is available
+        exists = to in _local_users
+        if not exists and _redis:
+            exists = bool(await _redis.hexists(_RK_PRESENCE, to))
         if exists:
             await sio.emit("msg_delivered", {"msg_id": msg_id}, to=to)
     except Exception as exc:

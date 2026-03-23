@@ -30,10 +30,6 @@ import socketio
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from fastapi.staticfiles import StaticFiles
-
-
-app.mount("/", StaticFiles(directory=".", html=True), name="static")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(

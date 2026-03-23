@@ -24,6 +24,7 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager
 
+import datetime as _dt
 import httpx
 import socketio
 from fastapi import FastAPI, Request
@@ -256,7 +257,7 @@ async def _quality_task(sid: str) -> None:
     except asyncio.CancelledError:
         pass
     except Exception as exc:
-        log.warning("quality_task sid=%s error: %s", sid[:8], exc)
+        log.error("quality_task sid=%s unexpected error: %s", sid[:8], exc, exc_info=True)
 
 
 # ── Zone expiry background task ───────────────────────────────────────────────
@@ -490,7 +491,7 @@ async def _redis_room_members(room: str) -> list[dict]:
     return [{"sid": s, "name": n} for s, n in zip(sids, names) if n]
 
 
-async def _redis_check_rate(sid: str, limit_str: str = None, key_suffix: str = "") -> bool:
+async def _redis_check_rate(sid: str, limit_str: str | None = None, key_suffix: str = "") -> bool:
     """
     Unified rate checker for both PTT messages and live chunks.
     key_suffix="" → PTT key, key_suffix=":live" → chunk key.
@@ -504,7 +505,7 @@ async def _redis_check_rate(sid: str, limit_str: str = None, key_suffix: str = "
     now    = time.time()
     cutoff = now - MSG_RATE_WINDOW
     key    = _RK_RATE + sid + key_suffix
-    member = f"{now:.6f}:{sid}"   # include sid for uniqueness across instances
+    member = f"{now:.6f}"   # key already scoped to sid — no suffix needed
 
     result = await _redis.eval(
         _LUA_RATE, 1,
@@ -533,7 +534,8 @@ async def _leave_room(sid: str) -> tuple[str | None, str]:
     _local_chunk_times.pop(sid, None)   # clean live rate state too
 
     if _redis:
-        if not joined:
+        # Only fetch joined_at if we know the user was in a room (avoids wasted round-trip)
+        if not joined and known:
             try:
                 joined = await _redis.hget(_RK_USER + sid, "joined_at")
             except Exception:
@@ -586,15 +588,16 @@ def _local_check_rate(sid: str, live: bool = False) -> bool:
 async def _get_room_and_name(sid: str) -> tuple[str | None, str]:
     """
     Fast local lookup with Redis fallback for cross-instance joins.
+    Uses hmget (single round-trip) instead of two sequential hget calls.
     Returns (room_or_None, name).
     """
     info = _local_users.get(sid)
     if info:
         return info.get("room"), info.get("name", sid[:6])
     if _redis:
-        room = await _redis.hget(_RK_USER + sid, "room")
-        name = await _redis.hget(_RK_USER + sid, "name") or sid[:6]
-        return room, name
+        # Single pipeline call — halves Redis latency vs two sequential hget
+        vals = await _redis.hmget(_RK_USER + sid, "room", "name")
+        return vals[0], (vals[1] or sid[:6])
     return None, sid[:6]
 
 
@@ -703,9 +706,7 @@ async def upsert_zone(request: Request) -> JSONResponse:
     if not (10 <= radius <= 50_000):
         return JSONResponse({"error": "radius must be 10–50000 m"}, status_code=400)
 
-    # Use time.time() directly — avoids datetime/timezone overhead, ISO format manual
     expires_ts = time.time() + ZONE_TTL_SECS
-    import datetime as _dt
     expires_at = _dt.datetime.fromtimestamp(expires_ts, tz=_dt.timezone.utc).isoformat()
 
     payload = {
@@ -782,7 +783,11 @@ async def connect(sid: str, environ: dict) -> None:
         "task":    None,
     }
     _quality[sid] = state
-    state["task"] = asyncio.create_task(_quality_task(sid), name=f"quality_{sid[:8]}")
+    try:
+        state["task"] = asyncio.create_task(_quality_task(sid), name=f"quality_{sid[:8]}")
+    except RuntimeError as exc:
+        # create_task can fail if the event loop is closing (e.g. shutdown race)
+        log.warning("connect: could not create quality task for %s: %s", sid[:8], exc)
 
 
 @sio.event
@@ -790,6 +795,10 @@ async def disconnect(sid: str) -> None:
     q = _quality.pop(sid, None)
     if q and (t := q.get("task")) and not t.done():
         t.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(t), timeout=1.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass  # expected — task cancelled or slow to exit
 
     try:
         old_room, name = await _leave_room(sid)
@@ -933,7 +942,10 @@ async def voice_chunk(sid: str, data: dict) -> None:
             return  # silently drop — live stream self-regulates
 
         stream_id = str(data.get("stream_id") or "")[:32]
-        seq       = int(data.get("seq") or 0)
+        try:
+            seq = int(data.get("seq") or 0)
+        except (TypeError, ValueError):
+            seq = 0
         mime      = str(data.get("mime") or "audio/webm")
         if mime not in ALLOWED_MIME:
             mime = "audio/webm"

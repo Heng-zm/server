@@ -228,7 +228,7 @@ async def _quality_task(sid: str) -> None:
     try:
         while True:
             await asyncio.sleep(QUALITY_INTERVAL)
-            nonce   = f"{sid}_{cycle}"
+            nonce   = f"{sid}_{cycle}_{os.urandom(2).hex()}"
             sent_at = time.monotonic()
             state["pending"][nonce] = sent_at
             await sio.emit("quality_ping", {"nonce": nonce}, to=sid)
@@ -298,7 +298,7 @@ async def _zone_expiry_task() -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.warning("Zone expiry task error: %s", exc)
+            log.error("Zone expiry task error: %s", exc, exc_info=True)
 
 
 # ── Render keepalive ──────────────────────────────────────────────────────────
@@ -315,9 +315,11 @@ async def _keepalive_task() -> None:
             await asyncio.sleep(KEEPALIVE_INTERVAL)
             try:
                 r = await client.get(url)
-                log.info("Keepalive ping  status=%d  uptime=%ss",
-                         r.status_code,
-                         r.json().get("uptime_s", "?") if r.is_success else "?")
+                try:
+                    uptime = r.json().get("uptime_s", "?") if r.is_success else "?"
+                except Exception:
+                    uptime = "?"
+                log.info("Keepalive ping  status=%d  uptime=%ss", r.status_code, uptime)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -505,7 +507,8 @@ async def _redis_check_rate(sid: str, limit_str: str | None = None, key_suffix: 
     now    = time.time()
     cutoff = now - MSG_RATE_WINDOW
     key    = _RK_RATE + sid + key_suffix
-    member = f"{now:.6f}"   # key already scoped to sid — no suffix needed
+    # Append 4 random hex chars so concurrent coroutines never collide on the same member
+    member = f"{now:.6f}:{os.urandom(2).hex()}"
 
     result = await _redis.eval(
         _LUA_RATE, 1,
@@ -574,7 +577,7 @@ def _local_check_rate(sid: str, live: bool = False) -> bool:
     limit  = MAX_CHUNK_RATE if live else MAX_MSG_RATE
     times  = store.get(sid)
     if times is None:
-        times = deque(maxlen=limit + 1)
+        times = deque()   # no maxlen — cutoff loop is the eviction mechanism
         store[sid] = times
     while times and times[0] <= cutoff:
         times.popleft()
@@ -585,6 +588,16 @@ def _local_check_rate(sid: str, live: bool = False) -> bool:
 
 
 # ── Room+name lookup — shared hot-path helper ─────────────────────────────────
+async def _get_room_fast(sid: str) -> str | None:
+    """Return room only — skips name lookup. Used by voice_chunk hot path."""
+    info = _local_users.get(sid)
+    if info:
+        return info.get("room")
+    if _redis:
+        return await _redis.hget(_RK_USER + sid, "room")
+    return None
+
+
 async def _get_room_and_name(sid: str) -> tuple[str | None, str]:
     """
     Fast local lookup with Redis fallback for cross-instance joins.
@@ -727,6 +740,7 @@ async def upsert_zone(request: Request) -> JSONResponse:
             log.error("Supabase upsert failed %s: %s", r.status_code, r.text[:200])
             return JSONResponse({"error": "upstream error", "status": r.status_code}, status_code=502)
 
+        log.info("   zone_save  id=%-20s  ch=%-18s  dev=%s", zone_id[:20], channel, device_id[:12])
         await sio.emit("zone_upserted", {
             "id": zone_id, "device_id": device_id,
             "name": payload["name"], "channel": channel,
@@ -775,6 +789,8 @@ async def delete_zone(zone_id: str, request: Request) -> JSONResponse:
 
 @sio.event
 async def connect(sid: str, environ: dict) -> None:
+    origin = (environ.get("HTTP_ORIGIN") or environ.get("HTTP_REFERER") or "")[:60]
+    log.info("[~] %-24s  origin=%s", sid, origin or "-")
     # Pre-create quality state BEFORE task starts — avoids race in _quality_task
     state: dict = {
         "pending": {},
@@ -814,6 +830,9 @@ async def disconnect(sid: str) -> None:
 @sio.event
 async def join_room(sid: str, data: dict) -> None:
     try:
+        if not isinstance(data, dict):
+            log.warning("join_room: non-dict payload from %s: %r", sid[:8], type(data))
+            return
         room = _sanitize_room(data.get("room", ""))
         name = _sanitize_name(data.get("name", ""), sid[:6])
         if not room:
@@ -926,9 +945,11 @@ async def voice_message(sid: str, data: dict) -> None:
 async def voice_chunk(sid: str, data: dict) -> None:
     """Live voice streaming — relay a single audio chunk to the room immediately."""
     try:
-        room, name = await _get_room_and_name(sid)
+        # Fast path: only room is strictly needed for relay; name comes from local cache
+        room = await _get_room_fast(sid)
         if not room:
             return
+        name = (_local_users.get(sid) or {}).get("name", sid[:6])
 
         audio = data.get("audio") or ""
         if not audio or not isinstance(audio, str):

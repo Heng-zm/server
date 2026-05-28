@@ -143,7 +143,8 @@ local sid      = ARGV[1]
 local room_pfx = ARGV[2]
 local room = redis.call('hget', user_key, 'room')
 local name = redis.call('hget', user_key, 'name')
-if not room then return {nil, nil} end
+local joined = redis.call('hget', user_key, 'joined_at')
+if not room then return {nil, nil, nil} end
 redis.call('del', user_key)
 redis.call('hdel', pres_key, sid)
 if room ~= '' then
@@ -153,7 +154,7 @@ if room ~= '' then
         redis.call('del', rk)
     end
 end
-return {room, name or ''}
+return {room, name or '', joined or ''}
 """
 
 # ── Shared clients ─────────────────────────────────────────────────────────────
@@ -465,9 +466,9 @@ async def _redis_atomic_join(sid: str, room: str, name: str) -> bool:
     return admitted
 
 
-async def _redis_leave(sid: str, known_room: str | None) -> tuple[str | None, str]:
+async def _redis_leave(sid: str, known_room: str | None) -> tuple[str | None, str, str | None]:
     if not _redis:
-        return None, sid[:6]
+        return None, sid[:6], None
 
     result = await _redis.eval(
         _LUA_LEAVE, 2,
@@ -475,8 +476,8 @@ async def _redis_leave(sid: str, known_room: str | None) -> tuple[str | None, st
         sid, _RK_ROOM,
     )
     if not result or result[0] is None:
-        return known_room, sid[:6]
-    return result[0] or known_room, result[1] or sid[:6]
+        return known_room, sid[:6], None
+    return result[0] or known_room, result[1] or sid[:6], result[2] or None
 
 
 async def _redis_room_members(room: str) -> list[dict]:
@@ -537,15 +538,11 @@ async def _leave_room(sid: str) -> tuple[str | None, str]:
     _local_chunk_times.pop(sid, None)   # clean live rate state too
 
     if _redis:
-        # Only fetch joined_at if we know the user was in a room (avoids wasted round-trip)
-        if not joined and known:
-            try:
-                joined = await _redis.hget(_RK_USER + sid, "joined_at")
-            except Exception:
-                joined = None
-        r_room, r_name = await _redis_leave(sid, known_room=known)
+        r_room, r_name, r_joined = await _redis_leave(sid, known_room=known)
         final_room = r_room or known
         final_name = r_name or name_loc
+        if r_joined:
+            joined = r_joined
     else:
         final_room = known
         final_name = name_loc
@@ -850,7 +847,6 @@ async def join_room(sid: str, data: dict) -> None:
             return
 
         await sio.enter_room(sid, room)
-        # joined_at already set as float in _redis_atomic_join — no overwrite needed
 
         members = await _redis_room_members(room) if _redis else _local_room_members(room)
         await asyncio.gather(

@@ -69,7 +69,11 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY",
 REDIS_URL    = os.environ.get("REDIS_URL", "")
 AI_ASSISTANT_URL = os.environ.get("AI_ASSISTANT_URL",
     "https://bot-voice-sqnz.onrender.com/ai-assistant")
+# Optional text chat endpoint. If empty, the server will try AI_ASSISTANT_URL
+# with a text payload and return a clear setup message if the backend does not support it.
+AI_CHAT_URL = os.environ.get("AI_CHAT_URL", "").strip()
 AI_TIMEOUT_SECS = _env_float("AI_TIMEOUT_SECS", 45.0, 5.0, 120.0)
+AI_CHAT_TIMEOUT_SECS = _env_float("AI_CHAT_TIMEOUT_SECS", AI_TIMEOUT_SECS, 5.0, 120.0)
 
 KEEPALIVE_URL = (
     os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
@@ -92,6 +96,9 @@ MAX_MSG_RATE    = _env_int("MAX_MSG_RATE", 4, 1, 60)
 MSG_RATE_WINDOW = _env_float("MSG_RATE_WINDOW", 10.0, 1.0, 60.0)
 MAX_CHUNK_BYTES = _env_int("MAX_CHUNK_BYTES", 220_000, 32_000, 1_500_000)
 MAX_CHUNK_RATE  = _env_int("MAX_CHUNK_RATE", 40, 4, 120)  # live chunks per MSG_RATE_WINDOW
+MAX_AI_TEXT_LEN = _env_int("MAX_AI_TEXT_LEN", 2_000, 64, 8_000)
+MAX_AI_HISTORY  = _env_int("MAX_AI_HISTORY", 12, 0, 40)
+MAX_AI_CHAT_RATE = _env_int("MAX_AI_CHAT_RATE", 8, 1, 60)
 
 ZONE_TTL_SECS: int = _env_int("ZONE_TTL_SECS", 5 * 3600, 300, 7 * 24 * 3600)
 
@@ -106,6 +113,7 @@ _RATE_TTL    = int(MSG_RATE_WINDOW * 2)
 # Pre-computed constant strings — avoids repeated str() on the hot path
 _S_MAX_MSG_RATE  = str(MAX_MSG_RATE)
 _S_MAX_CHUNK_RATE = str(MAX_CHUNK_RATE)
+_S_MAX_AI_CHAT_RATE = str(MAX_AI_CHAT_RATE)
 _S_RATE_TTL      = str(_RATE_TTL)
 _S_MAX_ROOM      = str(MAX_ROOM_SIZE)
 _S_USER_TTL      = str(_USER_TTL)
@@ -657,6 +665,151 @@ def _validate_color(raw: object) -> str:
     return s if _COLOR_RE.match(s) else "#007aff"
 
 
+
+# ── AI chat helpers ───────────────────────────────────────────────────────────
+def _clean_ai_text(value: object, limit: int = MAX_AI_TEXT_LEN) -> str:
+    text = str(value or "")
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text).strip()
+    return text[:limit]
+
+
+def _clean_ai_history(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    cleaned: list[dict[str, str]] = []
+    for item in value[-MAX_AI_HISTORY:]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").lower()
+        if role not in {"user", "assistant"}:
+            continue
+        text = _clean_ai_text(item.get("text") or item.get("content"), 800)
+        if text:
+            cleaned.append({"role": role, "text": text})
+    return cleaned
+
+
+def _extract_ai_reply(payload: object) -> str:
+    if isinstance(payload, str):
+        return _clean_ai_text(payload, 6000)
+    if not isinstance(payload, dict):
+        return ""
+
+    # Common simple response shapes.
+    for key in ("text", "reply", "response", "answer", "message", "content"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return _clean_ai_text(value, 6000)
+
+    # OpenAI/Anthropic-like response shapes, without requiring provider SDKs.
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            msg = first.get("message")
+            if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                return _clean_ai_text(msg["content"], 6000)
+            if isinstance(first.get("text"), str):
+                return _clean_ai_text(first["text"], 6000)
+
+    content = payload.get("content")
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+            elif isinstance(part, str):
+                parts.append(part)
+        if parts:
+            return _clean_ai_text("\n".join(parts), 6000)
+    return ""
+
+
+async def _call_ai_chat_backend(text: str, username: str, room: str, history: list[dict[str, str]]) -> str:
+    """Call a configurable text-AI endpoint and normalize its response."""
+    urls: list[str] = []
+    if AI_CHAT_URL:
+        urls.append(AI_CHAT_URL)
+    elif AI_ASSISTANT_URL:
+        # Backward-compatible fallback for deployments that extend /ai-assistant
+        # to accept text as well as audio.
+        urls.append(AI_ASSISTANT_URL)
+
+    if not urls:
+        return (
+            "AI chat backend is not configured yet. Set AI_CHAT_URL to a POST endpoint "
+            "that accepts JSON {text, message, username, room, history} and returns {text}."
+        )
+
+    payload = {
+        "text": text,
+        "message": text,
+        "prompt": text,
+        "username": username,
+        "room": room,
+        "history": history,
+        "source": "walkietalk_ai_chat",
+    }
+
+    last_error = ""
+    client = _ai_http or httpx.AsyncClient(timeout=AI_CHAT_TIMEOUT_SECS)
+    close_client = _ai_http is None
+    try:
+        for url in urls:
+            try:
+                resp = await client.post(url, json=payload, timeout=AI_CHAT_TIMEOUT_SECS)
+            except httpx.TimeoutException:
+                raise
+            except Exception as exc:
+                last_error = str(exc)
+                continue
+
+            if not resp.is_success:
+                last_error = f"AI backend HTTP {resp.status_code}: {resp.text[:180]}"
+                continue
+
+            try:
+                data = resp.json()
+            except ValueError:
+                reply = _clean_ai_text(resp.text, 6000)
+                if reply:
+                    return reply
+                last_error = "AI backend returned empty non-JSON response"
+                continue
+
+            reply = _extract_ai_reply(data)
+            if reply:
+                return reply
+            last_error = "AI backend returned JSON without text/reply/response"
+    finally:
+        if close_client:
+            await client.aclose()
+
+    if AI_CHAT_URL:
+        raise RuntimeError(last_error or "AI backend returned no usable response")
+    return (
+        "AI voice endpoint is online, but it did not return a text chat reply. "
+        "For text chat, set AI_CHAT_URL to your chat endpoint or update AI_ASSISTANT_URL to accept text payloads."
+    )
+
+
+async def _build_ai_chat_reply(raw: object) -> dict[str, object]:
+    if not isinstance(raw, dict):
+        raw = {}
+    text = _clean_ai_text(raw.get("text") or raw.get("message") or raw.get("prompt"))
+    if not text:
+        return {"ok": False, "error": "Message is empty"}
+    if len(text) > MAX_AI_TEXT_LEN:
+        return {"ok": False, "error": f"Message too long ({MAX_AI_TEXT_LEN} max)"}
+
+    username = _clean_ai_text(raw.get("username"), MAX_NAME_LEN).lower() or "guest"
+    username = _NAME_RE.sub("", username)[:MAX_NAME_LEN] or "guest"
+    room = _sanitize_room(raw.get("room")) or "AI-CHAT"
+    history = _clean_ai_history(raw.get("history"))
+
+    reply = await _call_ai_chat_backend(text, username, room, history)
+    return {"ok": True, "text": reply, "username": username, "room": room}
+
 # ── HTTP endpoints ─────────────────────────────────────────────────────────────
 
 
@@ -694,6 +847,34 @@ async def health() -> JSONResponse:
         "redis":       _last_ping_ok if _redis else None,
         "uptime_s":    round(now - _start_time),
     })
+
+
+
+@app.post("/ai/chat")
+async def ai_chat_http(request: Request) -> JSONResponse:
+    """HTTP fallback for AI text chat when Socket.IO is not connected."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    # Rate limit by client IP for HTTP fallback.
+    client_host = request.client.host if request.client else "unknown"
+    rate_sid = "http_ai:" + _DEV_RE.sub("_", client_host)[:80]
+    if not await _redis_check_rate(rate_sid, _S_MAX_AI_CHAT_RATE, ":ai"):
+        return JSONResponse({"ok": False, "error": "AI chat rate limited"}, status_code=429)
+
+    try:
+        result = await _build_ai_chat_reply(body)
+    except httpx.TimeoutException:
+        return JSONResponse({"ok": False, "error": "AI timed out"}, status_code=504)
+    except Exception as exc:
+        log.exception("ai_chat_http error: %s", exc)
+        return JSONResponse({"ok": False, "error": "AI chat backend offline"}, status_code=502)
+
+    if not result.get("ok"):
+        return JSONResponse(result, status_code=400)
+    return JSONResponse(result)
 
 
 @app.get("/zones/ping")
@@ -935,6 +1116,54 @@ async def update_name(sid: str, data: dict) -> None:
         log.info("   rename @%s -> @%s", old_name, new_name)
     except Exception as exc:
         log.exception("update_name sid=%s: %s", sid, exc)
+
+
+
+@sio.event
+async def ai_chat_message(sid: str, data: dict) -> None:
+    """Text chat with AI. Sends response only to the requesting client."""
+    msg_id = ""
+    try:
+        if not isinstance(data, dict):
+            data = {}
+        msg_id = str(data.get("msg_id") or "")[:80]
+
+        if not await _redis_check_rate(sid, _S_MAX_AI_CHAT_RATE, ":ai"):
+            await sio.emit("ai_chat_error", {"msg_id": msg_id, "error": "Slow down — too many AI messages"}, to=sid)
+            return
+
+        room, joined_name = await _get_room_and_name(sid)
+        if not room:
+            room = _sanitize_room(data.get("room")) or "AI-CHAT"
+        if not joined_name or joined_name == sid[:6]:
+            raw_name = str(data.get("username") or joined_name or "guest")
+            joined_name = _NAME_RE.sub("", raw_name.lower())[:MAX_NAME_LEN] or "guest"
+
+        body = dict(data)
+        body["room"] = room
+        body["username"] = joined_name
+
+        await sio.emit("ai_chat_typing", {"msg_id": msg_id, "on": True}, to=sid)
+        result = await _build_ai_chat_reply(body)
+        await sio.emit("ai_chat_typing", {"msg_id": msg_id, "on": False}, to=sid)
+
+        if not result.get("ok"):
+            await sio.emit("ai_chat_error", {"msg_id": msg_id, "error": result.get("error") or "AI chat error"}, to=sid)
+            return
+
+        await sio.emit("ai_chat_response", {
+            "msg_id": msg_id,
+            "text": result.get("text") or "No response",
+            "sender_name": "AI Assistant",
+        }, to=sid)
+        log.info("   ai_chat @%-14s room=%-18s %d chars", joined_name, room, len(str(data.get("text") or "")))
+    except httpx.TimeoutException:
+        await sio.emit("ai_chat_typing", {"msg_id": msg_id, "on": False}, to=sid)
+        await sio.emit("ai_chat_error", {"msg_id": msg_id, "error": "AI timed out"}, to=sid)
+    except Exception as exc:
+        log.exception("ai_chat_message sid=%s: %s", sid, exc)
+        await sio.emit("ai_chat_typing", {"msg_id": msg_id, "on": False}, to=sid)
+        await sio.emit("ai_chat_error", {"msg_id": msg_id, "error": "AI chat backend offline"}, to=sid)
 
 
 @sio.event

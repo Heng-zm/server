@@ -933,6 +933,55 @@ async def voice_message(sid: str, data: dict) -> None:
         )
         log.info("   voice @%-14s -> %-18s  %.1fs  %dB", name, room, duration, audio_len)
 
+        # ── AI Chatbot Integration ──
+        if room == "AI-BOT":
+            await sio.emit("status_update", {"msg": "AI is thinking...", "cls": "warn"}, to=sid)
+            try:
+                # Call external AI Voice assistant service
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.post(
+                        "https://bot-voice-sqnz.onrender.com/ai-assistant",
+                        json={
+                            "audio": audio,
+                            "mime": mime,
+                            "username": name
+                        }
+                    )
+                if resp.is_success:
+                    res_data = resp.json()
+                    ai_audio = res_data.get("audio")
+                    ai_mime = res_data.get("mime") or "audio/webm"
+                    try:
+                        ai_duration = min(float(res_data.get("duration") or 5.0), MAX_DURATION)
+                    except (TypeError, ValueError):
+                        ai_duration = 5.0
+                    
+                    if ai_audio:
+                        # Broadcast the AI's spoken reply to the room
+                        await sio.emit(
+                            "voice_message",
+                            {
+                                "audio": ai_audio,
+                                "mime": ai_mime,
+                                "duration": round(ai_duration, 1),
+                                "msg_id": f"ai_{int(time.time())}_{os.urandom(2).hex()}",
+                                "sender_sid": "ai_bot_sid",
+                                "sender_name": "AI Assistant"
+                            },
+                            room=room
+                        )
+                        await sio.emit("status_update", {"msg": "AI responded", "cls": "ok"}, to=sid)
+                    else:
+                        # No audio was returned — check for text response
+                        ai_text = res_data.get("text") or "No response"
+                        await sio.emit("status_update", {"msg": f"AI text: {ai_text[:30]}...", "cls": "ok"}, to=sid)
+                else:
+                    await sio.emit("status_update", {"msg": "AI server error", "cls": "err"}, to=sid)
+                    log.error("AI Assistant API returned %s: %s", resp.status_code, resp.text[:200])
+            except Exception as e:
+                await sio.emit("status_update", {"msg": "AI connection offline", "cls": "err"}, to=sid)
+                log.exception("AI Assistant API connection error: %s", e)
+
     except Exception as exc:
         log.exception("voice_message sid=%s: %s", sid, exc)
 

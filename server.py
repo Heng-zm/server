@@ -40,11 +40,36 @@ logging.basicConfig(
 log = logging.getLogger("walkie")
 
 # ── Config ────────────────────────────────────────────────────────────────────
+def _env_int(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+def _env_float(name: str, default: float, min_value: float | None = None, max_value: float | None = None) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL",
-    "https://bgqeqiyfgpdvgeepignt.supabase.co")
+    "https://bgqeqiyfgpdvgeepignt.supabase.co").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY",
     "sb_publishable_eLoAp9t0x-t7id3a-3LUow_SaBM6EC6")
 REDIS_URL    = os.environ.get("REDIS_URL", "")
+AI_ASSISTANT_URL = os.environ.get("AI_ASSISTANT_URL",
+    "https://bot-voice-sqnz.onrender.com/ai-assistant")
+AI_TIMEOUT_SECS = _env_float("AI_TIMEOUT_SECS", 45.0, 5.0, 120.0)
 
 KEEPALIVE_URL = (
     os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
@@ -58,17 +83,17 @@ _SB_HEADERS = {
 }
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-MAX_ROOM_SIZE   = 20
+MAX_ROOM_SIZE   = _env_int("MAX_ROOM_SIZE", 20, 2, 200)
 MAX_NAME_LEN    = 32
 MAX_ROOM_LEN    = 40
-MAX_AUDIO_BYTES = 8_000_000
-MAX_DURATION    = 65.0
-MAX_MSG_RATE    = 4
-MSG_RATE_WINDOW = 10.0
-MAX_CHUNK_BYTES = 200_000        # per live-voice chunk
-MAX_CHUNK_RATE  = 8              # chunks per MSG_RATE_WINDOW in live mode
+MAX_AUDIO_BYTES = _env_int("MAX_AUDIO_BYTES", 8_000_000, 256_000, 24_000_000)
+MAX_DURATION    = _env_float("MAX_DURATION", 65.0, 1.0, 300.0)
+MAX_MSG_RATE    = _env_int("MAX_MSG_RATE", 4, 1, 60)
+MSG_RATE_WINDOW = _env_float("MSG_RATE_WINDOW", 10.0, 1.0, 60.0)
+MAX_CHUNK_BYTES = _env_int("MAX_CHUNK_BYTES", 220_000, 32_000, 1_500_000)
+MAX_CHUNK_RATE  = _env_int("MAX_CHUNK_RATE", 40, 4, 120)  # live chunks per MSG_RATE_WINDOW
 
-ZONE_TTL_SECS: int = 5 * 3600   # 5 hours in seconds (avoids datetime import)
+ZONE_TTL_SECS: int = _env_int("ZONE_TTL_SECS", 5 * 3600, 300, 7 * 24 * 3600)
 
 # Redis key prefixes
 _RK_ROOM     = "wt:room:"
@@ -159,6 +184,7 @@ return {room, name or '', joined or ''}
 
 # ── Shared clients ─────────────────────────────────────────────────────────────
 _http:  httpx.AsyncClient | None = None
+_ai_http: httpx.AsyncClient | None = None
 _redis                           = None
 
 # ── Local in-memory state ──────────────────────────────────────────────────────
@@ -330,7 +356,7 @@ async def _keepalive_task() -> None:
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    global _http, _redis
+    global _http, _ai_http, _redis
 
     _http = httpx.AsyncClient(
         base_url=SUPABASE_URL,
@@ -342,6 +368,7 @@ async def _lifespan(app: FastAPI):
             keepalive_expiry=30,
         ),
     )
+    _ai_http = httpx.AsyncClient(timeout=AI_TIMEOUT_SECS)
 
     if REDIS_URL:
         try:
@@ -402,7 +429,10 @@ async def _lifespan(app: FastAPI):
         finally:
             await _redis.aclose()
 
-    await _http.aclose()
+    if _ai_http:
+        await _ai_http.aclose()
+    if _http:
+        await _http.aclose()
     log.info("WalkieTalk stopped  instance=%s", INSTANCE_ID)
 
 
@@ -628,6 +658,17 @@ def _validate_color(raw: object) -> str:
 
 
 # ── HTTP endpoints ─────────────────────────────────────────────────────────────
+
+
+@app.get("/")
+async def root() -> JSONResponse:
+    return JSONResponse({
+        "name": "WalkieTalk",
+        "status": "ok",
+        "health": "/health",
+        "zones": "/zones",
+        "socketio_path": "/socket.io",
+    })
 
 @app.get("/health")
 async def health() -> JSONResponse:
@@ -873,6 +914,8 @@ async def leave_room_event(sid: str, data: dict) -> None:
 @sio.event
 async def update_name(sid: str, data: dict) -> None:
     try:
+        if not isinstance(data, dict):
+            return
         new_name = _sanitize_name(data.get("name", ""), "")
         if not new_name:
             return
@@ -897,6 +940,8 @@ async def update_name(sid: str, data: dict) -> None:
 @sio.event
 async def voice_message(sid: str, data: dict) -> None:
     try:
+        if not isinstance(data, dict):
+            return
         room, name = await _get_room_and_name(sid)
         if not room:
             return
@@ -936,48 +981,64 @@ async def voice_message(sid: str, data: dict) -> None:
         # ── AI Chatbot Integration ──
         if room == "AI-BOT":
             await sio.emit("status_update", {"msg": "AI is thinking...", "cls": "warn"}, to=sid)
+            if not AI_ASSISTANT_URL:
+                await sio.emit("status_update", {"msg": "AI URL not configured", "cls": "err"}, to=sid)
+                return
             try:
-                # Call external AI Voice assistant service
-                async with httpx.AsyncClient(timeout=30.0) as client:
+                client = _ai_http or httpx.AsyncClient(timeout=AI_TIMEOUT_SECS)
+                close_client = _ai_http is None
+                try:
                     resp = await client.post(
-                        "https://bot-voice-sqnz.onrender.com/ai-assistant",
-                        json={
-                            "audio": audio,
-                            "mime": mime,
-                            "username": name
-                        }
+                        AI_ASSISTANT_URL,
+                        json={"audio": audio, "mime": mime, "username": name, "room": room},
                     )
-                if resp.is_success:
-                    res_data = resp.json()
-                    ai_audio = res_data.get("audio")
-                    ai_mime = res_data.get("mime") or "audio/webm"
-                    try:
-                        ai_duration = min(float(res_data.get("duration") or 5.0), MAX_DURATION)
-                    except (TypeError, ValueError):
-                        ai_duration = 5.0
-                    
-                    if ai_audio:
-                        # Broadcast the AI's spoken reply to the room
-                        await sio.emit(
-                            "voice_message",
-                            {
-                                "audio": ai_audio,
-                                "mime": ai_mime,
-                                "duration": round(ai_duration, 1),
-                                "msg_id": f"ai_{int(time.time())}_{os.urandom(2).hex()}",
-                                "sender_sid": "ai_bot_sid",
-                                "sender_name": "AI Assistant"
-                            },
-                            room=room
-                        )
-                        await sio.emit("status_update", {"msg": "AI responded", "cls": "ok"}, to=sid)
-                    else:
-                        # No audio was returned — check for text response
-                        ai_text = res_data.get("text") or "No response"
-                        await sio.emit("status_update", {"msg": f"AI text: {ai_text[:30]}...", "cls": "ok"}, to=sid)
-                else:
+                finally:
+                    if close_client:
+                        await client.aclose()
+
+                if not resp.is_success:
                     await sio.emit("status_update", {"msg": "AI server error", "cls": "err"}, to=sid)
                     log.error("AI Assistant API returned %s: %s", resp.status_code, resp.text[:200])
+                    return
+
+                try:
+                    res_data = resp.json()
+                except ValueError:
+                    await sio.emit("status_update", {"msg": "AI returned invalid JSON", "cls": "err"}, to=sid)
+                    return
+
+                ai_audio = res_data.get("audio")
+                ai_mime = str(res_data.get("mime") or "audio/webm")
+                if ai_mime not in ALLOWED_MIME:
+                    ai_mime = "audio/webm"
+                try:
+                    ai_duration = min(max(float(res_data.get("duration") or 5.0), 0.0), MAX_DURATION)
+                except (TypeError, ValueError):
+                    ai_duration = 5.0
+
+                if isinstance(ai_audio, str) and ai_audio:
+                    if len(ai_audio) > MAX_AUDIO_BYTES:
+                        await sio.emit("status_update", {"msg": "AI audio too large", "cls": "err"}, to=sid)
+                        log.warning("AI audio too large for @%s: %d chars", name, len(ai_audio))
+                        return
+                    await sio.emit(
+                        "voice_message",
+                        {
+                            "audio": ai_audio,
+                            "mime": ai_mime,
+                            "duration": round(ai_duration, 1),
+                            "msg_id": f"ai_{int(time.time())}_{os.urandom(2).hex()}",
+                            "sender_sid": "ai_bot_sid",
+                            "sender_name": "AI Assistant",
+                        },
+                        room=room,
+                    )
+                    await sio.emit("status_update", {"msg": "AI responded", "cls": "ok"}, to=sid)
+                else:
+                    ai_text = str(res_data.get("text") or "No response")[:120]
+                    await sio.emit("status_update", {"msg": f"AI text: {ai_text}", "cls": "ok"}, to=sid)
+            except httpx.TimeoutException:
+                await sio.emit("status_update", {"msg": "AI timed out", "cls": "err"}, to=sid)
             except Exception as e:
                 await sio.emit("status_update", {"msg": "AI connection offline", "cls": "err"}, to=sid)
                 log.exception("AI Assistant API connection error: %s", e)
@@ -990,6 +1051,8 @@ async def voice_message(sid: str, data: dict) -> None:
 async def voice_chunk(sid: str, data: dict) -> None:
     """Live voice streaming — relay a single audio chunk to the room immediately."""
     try:
+        if not isinstance(data, dict):
+            return
         # Fast path: only room is strictly needed for relay; name comes from local cache
         room = await _get_room_fast(sid)
         if not room:
@@ -1031,6 +1094,8 @@ async def voice_chunk(sid: str, data: dict) -> None:
 async def voice_stream_end(sid: str, data: dict) -> None:
     """Signal that a live stream ended — broadcast to room for cleanup."""
     try:
+        if not isinstance(data, dict):
+            data = {}
         room, name = await _get_room_and_name(sid)
         if not room:
             return
@@ -1050,6 +1115,8 @@ async def voice_stream_end(sid: str, data: dict) -> None:
 @sio.event
 async def quality_pong(sid: str, data: dict) -> None:
     try:
+        if not isinstance(data, dict):
+            return
         nonce = str(data.get("nonce") or "")
         if not nonce:
             return
@@ -1070,6 +1137,8 @@ async def quality_pong(sid: str, data: dict) -> None:
 @sio.event
 async def msg_delivered(sid: str, data: dict) -> None:
     try:
+        if not isinstance(data, dict):
+            return
         msg_id = str(data.get("msg_id") or "")[:64]
         to     = str(data.get("to") or "")[:128]
         if not msg_id or not to:

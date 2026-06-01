@@ -15,6 +15,7 @@ Environment variables:
     MAX_SCREEN_ICE_CHARS  = max ICE candidate payload length
     RENDER_EXTERNAL_URL   = set automatically by Render — used for self-ping keepalive
                             (set SERVER_URL manually on other platforms)
+    CORS_ORIGINS          = comma-separated allowed origins; default *
 
 Screen sharing:
     The server does WebRTC signaling only. It relays offers, answers, ICE candidates,
@@ -98,6 +99,15 @@ KEEPALIVE_URL = (
     or os.environ.get("SERVER_URL", "").rstrip("/")
 )
 
+_CORS_ORIGINS_RAW = os.environ.get("CORS_ORIGINS", "*").strip() or "*"
+if _CORS_ORIGINS_RAW == "*":
+    CORS_ALLOWED_ORIGINS: str | list[str] = "*"
+    FASTAPI_CORS_ORIGINS: list[str] = ["*"]
+else:
+    _origins = [o.strip() for o in _CORS_ORIGINS_RAW.split(",") if o.strip()]
+    CORS_ALLOWED_ORIGINS = _origins or "*"
+    FASTAPI_CORS_ORIGINS = _origins or ["*"]
+
 _SB_HEADERS = {
     "apikey":        SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -169,6 +179,9 @@ _NAME_RE  = re.compile(r"[^a-z0-9_\-]")
 _ROOM_RE  = re.compile(r"[^A-Z0-9_\-]")
 _DEV_RE   = re.compile(r"[^a-zA-Z0-9_\-]")
 _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+_SDP_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_SDP_SSRC_MSID_RE = re.compile(r"^(a=ssrc:\d+)\s+msid:\s*([^\s]+)\s+([^\s]+).*$")
+_SDP_LINE_TYPES = frozenset("vosiuepcbtrzkam")
 
 _start_time = time.time()
 
@@ -235,6 +248,20 @@ return {room, name or '', joined or ''}
 _http:  httpx.AsyncClient | None = None
 _ai_http: httpx.AsyncClient | None = None
 _redis                           = None
+_last_redis_fallback_log: float = 0.0
+
+
+def _log_redis_fallback(context: str, exc: Exception) -> None:
+    """Log Redis failures without flooding logs during a transient outage."""
+    global _last_redis_fallback_log
+    now = time.time()
+    if now - _last_redis_fallback_log >= 30.0:
+        _last_redis_fallback_log = now
+        log.warning(
+            "Redis %s failed; using local fallback where safe: %s",
+            context, exc,
+        )
+
 
 # ── Local in-memory state ──────────────────────────────────────────────────────
 _local_users:     dict[str, dict]         = {}
@@ -493,7 +520,7 @@ async def _lifespan(app: FastAPI):
 def _build_sio() -> socketio.AsyncServer:
     common = dict(
         async_mode="asgi",
-        cors_allowed_origins="*",
+        cors_allowed_origins=CORS_ALLOWED_ORIGINS,
         ping_timeout=60,
         ping_interval=25,
         max_http_buffer_size=MAX_AUDIO_BYTES + 512_000,
@@ -515,7 +542,7 @@ sio = _build_sio()
 app = FastAPI(title="WalkieTalk", docs_url=None, redoc_url=None, lifespan=_lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=FASTAPI_CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=False,
@@ -535,13 +562,20 @@ async def _redis_atomic_join(sid: str, room: str, name: str) -> bool:
         _local_rooms.setdefault(room, set()).add(sid)
         return True
 
-    result = await _redis.eval(
-        _LUA_JOIN, 3,
-        _RK_ROOM + room, _RK_USER + sid, _RK_PRESENCE,
-        sid, room, name,
-        _S_MAX_ROOM, f"{now_ts:.3f}", INSTANCE_ID, _S_USER_TTL,
-    )
-    admitted = bool(result)
+    try:
+        result = await _redis.eval(
+            _LUA_JOIN, 3,
+            _RK_ROOM + room, _RK_USER + sid, _RK_PRESENCE,
+            sid, room, name,
+            _S_MAX_ROOM, f"{now_ts:.3f}", INSTANCE_ID, _S_USER_TTL,
+        )
+        admitted = bool(result)
+    except Exception as exc:
+        _log_redis_fallback("join", exc)
+        if len(_local_rooms.get(room, set())) >= MAX_ROOM_SIZE:
+            return False
+        admitted = True
+
     if admitted:
         # Mirror in local state — float consistent with local path
         _local_users[sid] = {"room": room, "name": name, "joined_at": now_ts}
@@ -553,11 +587,15 @@ async def _redis_leave(sid: str, known_room: str | None) -> tuple[str | None, st
     if not _redis:
         return None, sid[:6], None
 
-    result = await _redis.eval(
-        _LUA_LEAVE, 2,
-        _RK_USER + sid, _RK_PRESENCE,
-        sid, _RK_ROOM,
-    )
+    try:
+        result = await _redis.eval(
+            _LUA_LEAVE, 2,
+            _RK_USER + sid, _RK_PRESENCE,
+            sid, _RK_ROOM,
+        )
+    except Exception as exc:
+        _log_redis_fallback("leave", exc)
+        return known_room, sid[:6], None
     if not result or result[0] is None:
         return known_room, sid[:6], None
     return result[0] or known_room, result[1] or sid[:6], result[2] or None
@@ -566,15 +604,19 @@ async def _redis_leave(sid: str, known_room: str | None) -> tuple[str | None, st
 async def _redis_room_members(room: str) -> list[dict]:
     if not _redis:
         return _local_room_members(room)
-    sids = await _redis.smembers(_RK_ROOM + room)
-    if not sids:
-        return []
-    sids = list(sids)[:MAX_ROOM_SIZE]
-    pipe = _redis.pipeline(transaction=False)
-    for sid in sids:
-        pipe.hget(_RK_USER + sid, "name")
-    names = await pipe.execute()
-    return [{"sid": s, "name": n} for s, n in zip(sids, names) if n]
+    try:
+        sids = await _redis.smembers(_RK_ROOM + room)
+        if not sids:
+            return []
+        sids = list(sids)[:MAX_ROOM_SIZE]
+        pipe = _redis.pipeline(transaction=False)
+        for sid in sids:
+            pipe.hget(_RK_USER + sid, "name")
+        names = await pipe.execute()
+        return [{"sid": s, "name": n} for s, n in zip(sids, names) if n]
+    except Exception as exc:
+        _log_redis_fallback("room_members", exc)
+        return _local_room_members(room)
 
 
 async def _redis_check_rate(sid: str, limit_str: str | None = None, key_suffix: str = "") -> bool:
@@ -595,13 +637,17 @@ async def _redis_check_rate(sid: str, limit_str: str | None = None, key_suffix: 
     # Append 4 random hex chars so concurrent coroutines never collide on the same member
     member = f"{now:.6f}:{os.urandom(2).hex()}"
 
-    result = await _redis.eval(
-        _LUA_RATE, 1,
-        key,
-        f"{cutoff:.6f}", member, f"{now:.6f}",
-        _limit, _S_RATE_TTL,
-    )
-    return bool(result)
+    try:
+        result = await _redis.eval(
+            _LUA_RATE, 1,
+            key,
+            f"{cutoff:.6f}", member, f"{now:.6f}",
+            _limit, _S_RATE_TTL,
+        )
+        return bool(result)
+    except Exception as exc:
+        _log_redis_fallback("rate_limit", exc)
+        return _local_check_rate(sid, int(_limit), key_suffix)
 
 
 # ── Unified leave ─────────────────────────────────────────────────────────────
@@ -686,7 +732,10 @@ async def _get_room_fast(sid: str) -> str | None:
     if info:
         return info.get("room")
     if _redis:
-        return await _redis.hget(_RK_USER + sid, "room")
+        try:
+            return await _redis.hget(_RK_USER + sid, "room")
+        except Exception as exc:
+            _log_redis_fallback("get_room", exc)
     return None
 
 
@@ -701,8 +750,11 @@ async def _get_room_and_name(sid: str) -> tuple[str | None, str]:
         return info.get("room"), info.get("name", sid[:6])
     if _redis:
         # Single pipeline call — halves Redis latency vs two sequential hget
-        vals = await _redis.hmget(_RK_USER + sid, "room", "name")
-        return vals[0], (vals[1] or sid[:6])
+        try:
+            vals = await _redis.hmget(_RK_USER + sid, "room", "name")
+            return vals[0], (vals[1] or sid[:6])
+        except Exception as exc:
+            _log_redis_fallback("get_room_name", exc)
     return None, sid[:6]
 
 
@@ -766,27 +818,106 @@ def _clean_webrtc_type(value: object, allowed: set[str], default: str) -> str:
 
 
 def _clean_sdp(value: object) -> str | None:
+    """Return a browser-safe SDP string or None.
+
+    Some clients accidentally send nested RTCSessionDescription objects, literal
+    escaped newlines, LF-only SDP, or malformed/empty lines. Browsers are strict
+    in setRemoteDescription(), so normalize line endings and drop only obviously
+    invalid SDP rows before relaying.
+    """
+    if isinstance(value, dict):
+        value = value.get("sdp") or value.get("value") or ""
     if not isinstance(value, str):
         return None
-    value = value.strip()
-    if not value or len(value) > MAX_SCREEN_SDP_CHARS:
+
+    raw = value.strip()
+    if not raw or len(raw) > MAX_SCREEN_SDP_CHARS:
         return None
-    return value
+
+    # Handle payloads that were accidentally double-escaped by a client.
+    raw = raw.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+
+    lines: list[str] = []
+    dropped = 0
+    for raw_line in raw.split("\n"):
+        line = _SDP_CONTROL_RE.sub("", raw_line).strip()
+        if not line:
+            continue
+
+        # Repair the common broken form: "a=ssrc:<id> msid: <stream> <track> ..."
+        # and trim trailing garbage after the two msid tokens.
+        if line.startswith("a=ssrc:") and " msid" in line:
+            fixed = _SDP_SSRC_MSID_RE.match(line)
+            if fixed:
+                line = f"{fixed.group(1)} msid:{fixed.group(2)} {fixed.group(3)}"
+
+        if len(line) < 2 or line[1] != "=" or line[0] not in _SDP_LINE_TYPES:
+            dropped += 1
+            continue
+        lines.append(line)
+
+    if not lines:
+        return None
+
+    # A valid SDP starts with v=0. If a noisy prefix was removed and v=0 exists
+    # later, start from that point. Otherwise reject.
+    if lines[0] != "v=0":
+        try:
+            v0 = lines.index("v=0")
+            dropped += v0
+            lines = lines[v0:]
+        except ValueError:
+            return None
+
+    if dropped:
+        log.debug("SDP sanitizer dropped %d malformed line(s)", dropped)
+
+    return "\r\n".join(lines) + "\r\n"
+
+
+def _sdp_from_data(data: dict, *keys: str) -> str | None:
+    """Extract SDP from flat or nested signaling payloads."""
+    for key in keys:
+        sdp = _clean_sdp(data.get(key))
+        if sdp:
+            return sdp
+    for key in ("description", "desc", "offer", "answer"):
+        sdp = _clean_sdp(data.get(key))
+        if sdp:
+            return sdp
+    return None
 
 
 def _clean_ice_candidate(value: object) -> object | None:
     if isinstance(value, dict):
         candidate = str(value.get("candidate") or "").strip()
+        if candidate.startswith("a=candidate:"):
+            candidate = candidate[2:]
         if not candidate or len(candidate) > MAX_SCREEN_ICE_CHARS:
             return None
-        return {
-            "candidate": candidate,
-            "sdpMid": _clean_small_text(value.get("sdpMid"), 64),
-            "sdpMLineIndex": value.get("sdpMLineIndex") if isinstance(value.get("sdpMLineIndex"), int) else None,
-            "usernameFragment": _clean_small_text(value.get("usernameFragment"), 128),
-        }
+
+        idx = value.get("sdpMLineIndex")
+        try:
+            idx = int(idx) if idx is not None and str(idx).strip() != "" else None
+        except (TypeError, ValueError):
+            idx = None
+
+        payload: dict[str, object] = {"candidate": candidate}
+        sdp_mid = _clean_small_text(value.get("sdpMid"), 64)
+        username_fragment = _clean_small_text(value.get("usernameFragment"), 128)
+        if sdp_mid:
+            payload["sdpMid"] = sdp_mid
+        if idx is not None:
+            payload["sdpMLineIndex"] = idx
+        if username_fragment:
+            payload["usernameFragment"] = username_fragment
+        return payload
+
     if isinstance(value, str):
         value = value.strip()
+        if value.startswith("a=candidate:"):
+            value = value[2:]
         if not value or len(value) > MAX_SCREEN_ICE_CHARS:
             return None
         return value
@@ -818,7 +949,11 @@ async def _get_screen_state(room: str) -> dict | None:
             return _public_screen_state(state)
         _local_screens.pop(room, None)
     if _redis:
-        raw = await _redis.hgetall(_RK_SCREEN + room)
+        try:
+            raw = await _redis.hgetall(_RK_SCREEN + room)
+        except Exception as exc:
+            _log_redis_fallback("get_screen_state", exc)
+            raw = {}
         if raw:
             state = {
                 "room": room,
@@ -839,24 +974,31 @@ async def _set_screen_state(room: str, state: dict) -> None:
     _local_screens[room] = state
     if _redis:
         key = _RK_SCREEN + room
-        await _redis.hset(key, mapping={
-            "room": room,
-            "stream_id": state["stream_id"],
-            "sender_sid": state["sender_sid"],
-            "sender_name": state["sender_name"],
-            "kind": state.get("kind", "screen"),
-            "title": state.get("title", ""),
-            "has_audio": "1" if state.get("has_audio") else "0",
-            "started_at": f"{float(state.get('started_at') or time.time()):.3f}",
-        })
-        await _redis.expire(key, SCREEN_STATE_TTL)
+        try:
+            await _redis.hset(key, mapping={
+                "room": room,
+                "stream_id": state["stream_id"],
+                "sender_sid": state["sender_sid"],
+                "sender_name": state["sender_name"],
+                "kind": state.get("kind", "screen"),
+                "title": state.get("title", ""),
+                "has_audio": "1" if state.get("has_audio") else "0",
+                "started_at": f"{float(state.get('started_at') or time.time()):.3f}",
+            })
+            await _redis.expire(key, SCREEN_STATE_TTL)
+        except Exception as exc:
+            _log_redis_fallback("set_screen_state", exc)
 
 
 async def _clear_screen_state(room: str) -> dict | None:
     state = _local_screens.pop(room, None)
     if _redis:
-        raw = await _redis.hgetall(_RK_SCREEN + room)
-        await _redis.delete(_RK_SCREEN + room)
+        try:
+            raw = await _redis.hgetall(_RK_SCREEN + room)
+            await _redis.delete(_RK_SCREEN + room)
+        except Exception as exc:
+            _log_redis_fallback("clear_screen_state", exc)
+            raw = {}
         if raw and not state:
             state = {
                 "room": room,
@@ -878,8 +1020,11 @@ async def _sid_in_room(target_sid: str, room: str) -> bool:
     if info and info.get("room") == room:
         return True
     if _redis:
-        target_room = await _redis.hget(_RK_USER + target_sid, "room")
-        return target_room == room
+        try:
+            target_room = await _redis.hget(_RK_USER + target_sid, "room")
+            return target_room == room
+        except Exception as exc:
+            _log_redis_fallback("sid_in_room", exc)
     return False
 
 
@@ -1088,6 +1233,7 @@ async def root() -> JSONResponse:
             "ai_chat": True,
             "geo_zones": True,
             "screen_share_signaling": True,
+            "sdp_sanitizer": True,
         },
         "screen_share_events": [
             "screen_share_start", "screen_share_stop", "screen_share_state",
@@ -1780,7 +1926,7 @@ async def screen_offer(sid: str, data: dict) -> None:
 
         room, name = await _get_room_and_name(sid)
         target_sid = str(data.get("to") or data.get("target_sid") or "")[:128]
-        sdp = _clean_sdp(data.get("sdp"))
+        sdp = _sdp_from_data(data, "sdp")
         offer_type = _clean_webrtc_type(data.get("type"), {"offer"}, "offer")
         if not room or not target_sid or not sdp:
             await _emit_screen_error(sid, "BAD_OFFER", "screen_offer needs target_sid/to and valid SDP")
@@ -1816,7 +1962,7 @@ async def screen_answer(sid: str, data: dict) -> None:
             return
 
         room, name = await _get_room_and_name(sid)
-        sdp = _clean_sdp(data.get("sdp"))
+        sdp = _sdp_from_data(data, "sdp")
         answer_type = _clean_webrtc_type(data.get("type"), {"answer"}, "answer")
         if not room or not sdp:
             await _emit_screen_error(sid, "BAD_ANSWER", "screen_answer needs valid SDP")

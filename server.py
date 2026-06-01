@@ -9,8 +9,16 @@ Environment variables:
     AI_ASSISTANT_URL      = https://bot-voice-sqnz.onrender.com/ai-assistant
     AI_CHAT_URL           = optional dedicated text-chat endpoint; empty = use AI_ASSISTANT_URL
     AI_ASSISTANT_API_KEY  = same value as AI_API_KEY on the bot-voice server
+                            (AI_API_KEY is also accepted as a fallback)
+    MAX_SCREEN_SIGNAL_RATE= WebRTC screen-share signaling events per rate window
+    MAX_SCREEN_SDP_CHARS  = max SDP offer/answer payload length
+    MAX_SCREEN_ICE_CHARS  = max ICE candidate payload length
     RENDER_EXTERNAL_URL   = set automatically by Render — used for self-ping keepalive
                             (set SERVER_URL manually on other platforms)
+
+Screen sharing:
+    The server does WebRTC signaling only. It relays offers, answers, ICE candidates,
+    and room state. Video/audio screen tracks must be sent peer-to-peer by clients.
 
 Run locally:
     uvicorn server:socket_app --host 0.0.0.0 --port 3000 --reload
@@ -104,8 +112,10 @@ def _ai_headers() -> dict[str, str]:
         "Content-Type": "application/json",
     }
     if AI_ASSISTANT_API_KEY:
-        # bot-voice /ai-assistant accepts X-Api-Key or Authorization: Bearer.
+        # bot-voice /ai-assistant accepts X-Api-Key. Authorization is added too
+        # for deployments that use Bearer verification.
         headers["X-Api-Key"] = AI_ASSISTANT_API_KEY
+        headers["Authorization"] = f"Bearer {AI_ASSISTANT_API_KEY}"
     return headers
 
 
@@ -123,6 +133,12 @@ MAX_AI_TEXT_LEN = _env_int("MAX_AI_TEXT_LEN", 2_000, 64, 8_000)
 MAX_AI_HISTORY  = _env_int("MAX_AI_HISTORY", 12, 0, 40)
 MAX_AI_CHAT_RATE = _env_int("MAX_AI_CHAT_RATE", 8, 1, 60)
 
+# Screen sharing is WebRTC signaling only. Do not relay video frames through Socket.IO.
+MAX_SCREEN_SIGNAL_RATE = _env_int("MAX_SCREEN_SIGNAL_RATE", 50, 5, 240)
+MAX_SCREEN_SDP_CHARS   = _env_int("MAX_SCREEN_SDP_CHARS", 80_000, 4_000, 250_000)
+MAX_SCREEN_ICE_CHARS   = _env_int("MAX_SCREEN_ICE_CHARS", 16_000, 1_000, 80_000)
+SCREEN_STATE_TTL       = _env_int("SCREEN_STATE_TTL", 6 * 3600, 60, 24 * 3600)
+
 ZONE_TTL_SECS: int = _env_int("ZONE_TTL_SECS", 5 * 3600, 300, 7 * 24 * 3600)
 
 # Redis key prefixes
@@ -130,6 +146,7 @@ _RK_ROOM     = "wt:room:"
 _RK_USER     = "wt:user:"
 _RK_RATE     = "wt:rate:"
 _RK_PRESENCE = "wt:presence"
+_RK_SCREEN   = "wt:screen:"
 _USER_TTL    = 3600
 _RATE_TTL    = int(MSG_RATE_WINDOW * 2)
 
@@ -137,6 +154,7 @@ _RATE_TTL    = int(MSG_RATE_WINDOW * 2)
 _S_MAX_MSG_RATE  = str(MAX_MSG_RATE)
 _S_MAX_CHUNK_RATE = str(MAX_CHUNK_RATE)
 _S_MAX_AI_CHAT_RATE = str(MAX_AI_CHAT_RATE)
+_S_MAX_SCREEN_SIGNAL_RATE = str(MAX_SCREEN_SIGNAL_RATE)
 _S_RATE_TTL      = str(_RATE_TTL)
 _S_MAX_ROOM      = str(MAX_ROOM_SIZE)
 _S_USER_TTL      = str(_USER_TTL)
@@ -221,8 +239,11 @@ _redis                           = None
 # ── Local in-memory state ──────────────────────────────────────────────────────
 _local_users:     dict[str, dict]         = {}
 _local_rooms:     dict[str, set]          = {}
-_local_msg_times: dict[str, deque[float]] = {}   # PTT rate
-_local_chunk_times: dict[str, deque[float]] = {}  # live chunk rate
+_local_msg_times: dict[str, deque[float]] = {}      # PTT / fallback generic rate
+_local_chunk_times: dict[str, deque[float]] = {}    # live audio chunk rate
+_local_signal_times: dict[str, deque[float]] = {}   # WebRTC signaling rate
+_local_ai_times: dict[str, deque[float]] = {}       # AI chat rate
+_local_screens: dict[str, dict] = {}                # room -> active screen share state
 
 INSTANCE_ID = f"inst_{os.getpid()}_{int(time.time()) % 10000}"
 
@@ -443,6 +464,7 @@ async def _lifespan(app: FastAPI):
                                 if q.get("task") and not q["task"].done()],
                              return_exceptions=True)
     _quality.clear()
+    _local_screens.clear()
 
     if _redis:
         try:
@@ -557,14 +579,15 @@ async def _redis_room_members(room: str) -> list[dict]:
 
 async def _redis_check_rate(sid: str, limit_str: str | None = None, key_suffix: str = "") -> bool:
     """
-    Unified rate checker for both PTT messages and live chunks.
-    key_suffix="" → PTT key, key_suffix=":live" → chunk key.
-    limit_str defaults to _S_MAX_MSG_RATE.
+    Unified rate checker for PTT, live chunks, AI chat, and WebRTC signaling.
+    key_suffix=""        -> PTT key
+    key_suffix=":live"   -> live audio chunks
+    key_suffix=":ai"     -> AI chat
+    key_suffix=":signal" -> screen-share signaling
     """
     _limit = limit_str or _S_MAX_MSG_RATE
     if not _redis:
-        # Local fallback — uses the appropriate deque based on suffix
-        return _local_check_rate(sid, live=(key_suffix == ":live"))
+        return _local_check_rate(sid, int(_limit), key_suffix)
 
     now    = time.time()
     cutoff = now - MSG_RATE_WINDOW
@@ -597,6 +620,8 @@ async def _leave_room(sid: str) -> tuple[str | None, str]:
     _local_users.pop(sid, None)
     _local_msg_times.pop(sid, None)
     _local_chunk_times.pop(sid, None)   # clean live rate state too
+    _local_signal_times.pop(sid, None)
+    _local_ai_times.pop(sid, None)
 
     if _redis:
         r_room, r_name, r_joined = await _redis_leave(sid, known_room=known)
@@ -627,12 +652,21 @@ def _local_room_members(room: str) -> list[dict]:
             for s in room_set if s in _local_users]
 
 
-def _local_check_rate(sid: str, live: bool = False) -> bool:
-    """Single local rate checker for both PTT (live=False) and chunk (live=True)."""
+def _local_rate_store(key_suffix: str) -> dict[str, deque[float]]:
+    if key_suffix == ":live":
+        return _local_chunk_times
+    if key_suffix == ":signal":
+        return _local_signal_times
+    if key_suffix == ":ai":
+        return _local_ai_times
+    return _local_msg_times
+
+
+def _local_check_rate(sid: str, limit: int, key_suffix: str = "") -> bool:
+    """Local fallback rate checker used when Redis is disabled/unavailable."""
     now    = time.time()
     cutoff = now - MSG_RATE_WINDOW
-    store  = _local_chunk_times if live else _local_msg_times
-    limit  = MAX_CHUNK_RATE if live else MAX_MSG_RATE
+    store  = _local_rate_store(key_suffix)
     times  = store.get(sid)
     if times is None:
         times = deque()   # no maxlen — cutoff loop is the eviction mechanism
@@ -694,6 +728,195 @@ def _strip_data_url_base64(value: object) -> str:
     if text.lower().startswith("data:") and "," in text:
         return text.split(",", 1)[1].strip()
     return text
+
+
+# ── Screen sharing / WebRTC signaling helpers ───────────────────────────────
+
+def _clean_small_text(value: object, limit: int = 128) -> str:
+    text = str(value or "")
+    text = re.sub(r"[\x00-\x1f\x7f]", "", text).strip()
+    return text[:limit]
+
+
+def _safe_bool(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _sanitize_stream_id(value: object) -> str:
+    stream_id = _DEV_RE.sub("", str(value or "").strip())[:48]
+    return stream_id or f"screen_{int(time.time())}_{os.urandom(2).hex()}"
+
+
+def _clean_screen_kind(value: object) -> str:
+    kind = str(value or "screen").strip().lower()
+    return kind if kind in {"screen", "window", "tab"} else "screen"
+
+
+def _clean_webrtc_type(value: object, allowed: set[str], default: str) -> str:
+    text = str(value or default).strip().lower()
+    return text if text in allowed else default
+
+
+def _clean_sdp(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or len(value) > MAX_SCREEN_SDP_CHARS:
+        return None
+    return value
+
+
+def _clean_ice_candidate(value: object) -> object | None:
+    if isinstance(value, dict):
+        candidate = str(value.get("candidate") or "").strip()
+        if not candidate or len(candidate) > MAX_SCREEN_ICE_CHARS:
+            return None
+        return {
+            "candidate": candidate,
+            "sdpMid": _clean_small_text(value.get("sdpMid"), 64),
+            "sdpMLineIndex": value.get("sdpMLineIndex") if isinstance(value.get("sdpMLineIndex"), int) else None,
+            "usernameFragment": _clean_small_text(value.get("usernameFragment"), 128),
+        }
+    if isinstance(value, str):
+        value = value.strip()
+        if not value or len(value) > MAX_SCREEN_ICE_CHARS:
+            return None
+        return value
+    return None
+
+
+def _public_screen_state(state: dict | None) -> dict | None:
+    if not state:
+        return None
+    return {
+        "room": state.get("room", ""),
+        "stream_id": state.get("stream_id", ""),
+        "sender_sid": state.get("sender_sid", ""),
+        "sender_name": state.get("sender_name", ""),
+        "kind": state.get("kind", "screen"),
+        "title": state.get("title", ""),
+        "has_audio": bool(state.get("has_audio", False)),
+        "started_at": float(state.get("started_at") or 0.0),
+    }
+
+
+async def _get_screen_state(room: str) -> dict | None:
+    if not room:
+        return None
+    state = _local_screens.get(room)
+    if state:
+        started_at = float(state.get("started_at") or 0.0)
+        if started_at and (time.time() - started_at) <= SCREEN_STATE_TTL:
+            return _public_screen_state(state)
+        _local_screens.pop(room, None)
+    if _redis:
+        raw = await _redis.hgetall(_RK_SCREEN + room)
+        if raw:
+            state = {
+                "room": room,
+                "stream_id": raw.get("stream_id", ""),
+                "sender_sid": raw.get("sender_sid", ""),
+                "sender_name": raw.get("sender_name", ""),
+                "kind": raw.get("kind", "screen"),
+                "title": raw.get("title", ""),
+                "has_audio": raw.get("has_audio") == "1",
+                "started_at": float(raw.get("started_at") or 0.0),
+            }
+            _local_screens[room] = state
+            return _public_screen_state(state)
+    return None
+
+
+async def _set_screen_state(room: str, state: dict) -> None:
+    _local_screens[room] = state
+    if _redis:
+        key = _RK_SCREEN + room
+        await _redis.hset(key, mapping={
+            "room": room,
+            "stream_id": state["stream_id"],
+            "sender_sid": state["sender_sid"],
+            "sender_name": state["sender_name"],
+            "kind": state.get("kind", "screen"),
+            "title": state.get("title", ""),
+            "has_audio": "1" if state.get("has_audio") else "0",
+            "started_at": f"{float(state.get('started_at') or time.time()):.3f}",
+        })
+        await _redis.expire(key, SCREEN_STATE_TTL)
+
+
+async def _clear_screen_state(room: str) -> dict | None:
+    state = _local_screens.pop(room, None)
+    if _redis:
+        raw = await _redis.hgetall(_RK_SCREEN + room)
+        await _redis.delete(_RK_SCREEN + room)
+        if raw and not state:
+            state = {
+                "room": room,
+                "stream_id": raw.get("stream_id", ""),
+                "sender_sid": raw.get("sender_sid", ""),
+                "sender_name": raw.get("sender_name", ""),
+                "kind": raw.get("kind", "screen"),
+                "title": raw.get("title", ""),
+                "has_audio": raw.get("has_audio") == "1",
+                "started_at": float(raw.get("started_at") or 0.0),
+            }
+    return _public_screen_state(state)
+
+
+async def _sid_in_room(target_sid: str, room: str) -> bool:
+    if not target_sid or not room:
+        return False
+    info = _local_users.get(target_sid)
+    if info and info.get("room") == room:
+        return True
+    if _redis:
+        target_room = await _redis.hget(_RK_USER + target_sid, "room")
+        return target_room == room
+    return False
+
+
+async def _emit_screen_error(sid: str, code: str, msg: str, data: dict | None = None) -> None:
+    payload = {"code": code, "msg": msg}
+    if data:
+        payload.update(data)
+    await sio.emit("screen_share_error", payload, to=sid)
+
+
+async def _stop_screen_share_for_sid(sid: str, reason: str = "stopped") -> None:
+    """Stop any active screen share owned by sid. Used on leave/disconnect."""
+    room = None
+    for room_name, state in list(_local_screens.items()):
+        if state.get("sender_sid") == sid:
+            room = room_name
+            break
+    if room is None and _redis:
+        # Best effort: scan only screen keys. This runs on leave/disconnect, not hot path.
+        try:
+            async for key in _redis.scan_iter(match=f"{_RK_SCREEN}*"):
+                raw = await _redis.hgetall(key)
+                if raw.get("sender_sid") == sid:
+                    room = key[len(_RK_SCREEN):]
+                    break
+        except Exception as exc:
+            log.warning("screen cleanup scan failed for sid=%s: %s", sid[:8], exc)
+    if not room:
+        return
+    state = await _clear_screen_state(room)
+    await sio.emit("screen_share_stopped", {
+        "room": room,
+        "stream_id": (state or {}).get("stream_id", ""),
+        "sender_sid": sid,
+        "reason": reason,
+    }, room=room)
+    log.info("   screen_stop sid=%-8s room=%-18s reason=%s", sid[:8], room, reason)
 
 
 # ── AI chat helpers ───────────────────────────────────────────────────────────
@@ -857,7 +1080,19 @@ async def root() -> JSONResponse:
         "status": "ok",
         "health": "/health",
         "zones": "/zones",
+        "ai_chat": "/ai/chat",
         "socketio_path": "/socket.io",
+        "features": {
+            "voice_relay": True,
+            "live_voice_chunks": True,
+            "ai_chat": True,
+            "geo_zones": True,
+            "screen_share_signaling": True,
+        },
+        "screen_share_events": [
+            "screen_share_start", "screen_share_stop", "screen_share_state",
+            "screen_viewer_ready", "screen_offer", "screen_answer", "screen_ice_candidate",
+        ],
     })
 
 @app.get("/health")
@@ -875,12 +1110,14 @@ async def health() -> JSONResponse:
     # Snapshot local state once — avoid repeated dict access
     conn  = len(_local_users)
     rooms = {k: len(v) for k, v in _local_rooms.items()}
+    screens = {room: _public_screen_state(state) for room, state in _local_screens.items()}
 
     return JSONResponse({
         "status":      "ok",
         "instance":    INSTANCE_ID,
         "connections": conn,
         "rooms_local": rooms,
+        "screen_shares_local": screens,
         "redis":       _last_ping_ok if _redis else None,
         "uptime_s":    round(now - _start_time),
     })
@@ -1073,6 +1310,7 @@ async def disconnect(sid: str) -> None:
             pass  # expected — task cancelled or slow to exit
 
     try:
+        await _stop_screen_share_for_sid(sid, reason="disconnect")
         old_room, name = await _leave_room(sid)
     except Exception as exc:
         log.exception("_leave_room on disconnect sid=%s: %s", sid, exc)
@@ -1094,6 +1332,7 @@ async def join_room(sid: str, data: dict) -> None:
         if not room:
             return
 
+        await _stop_screen_share_for_sid(sid, reason="room_change")
         old_room, old_name = await _leave_room(sid)
         if old_room and old_room != room:
             await sio.leave_room(sid, old_room)
@@ -1108,9 +1347,10 @@ async def join_room(sid: str, data: dict) -> None:
         await sio.enter_room(sid, room)
 
         members = await _redis_room_members(room) if _redis else _local_room_members(room)
+        active_screen = await _get_screen_state(room)
         await asyncio.gather(
             sio.emit("peer_joined", {"sid": sid, "name": name}, room=room, skip_sid=sid),
-            sio.emit("room_state",  {"members": members}, to=sid),
+            sio.emit("room_state",  {"members": members, "screen_share": active_screen}, to=sid),
         )
         log.info("[+] %-24s @%-16s  room=%-20s  n=%d", sid, name, room, len(members))
 
@@ -1121,6 +1361,7 @@ async def join_room(sid: str, data: dict) -> None:
 @sio.event
 async def leave_room_event(sid: str, data: dict) -> None:
     try:
+        await _stop_screen_share_for_sid(sid, reason="leave_room")
         old_room, name = await _leave_room(sid)
         if old_room:
             await sio.leave_room(sid, old_room)
@@ -1149,6 +1390,12 @@ async def update_name(sid: str, data: dict) -> None:
         if _redis and name_changed:
             await _redis.hset(_RK_USER + sid, "name", new_name)
         if room:
+            active_screen = await _get_screen_state(room)
+            if active_screen and active_screen.get("sender_sid") == sid:
+                local_state = _local_screens.get(room) or dict(active_screen)
+                local_state["sender_name"] = new_name
+                await _set_screen_state(room, local_state)
+                await sio.emit("screen_share_state", {"screen_share": await _get_screen_state(room)}, room=room)
             await sio.emit("peer_name_updated", {"sid": sid, "name": new_name}, room=room, skip_sid=sid)
         log.info("   rename @%s -> @%s", old_name, new_name)
     except Exception as exc:
@@ -1387,6 +1634,241 @@ async def voice_stream_end(sid: str, data: dict) -> None:
 
     except Exception as exc:
         log.exception("voice_stream_end sid=%s: %s", sid, exc)
+
+
+@sio.event
+async def screen_share_start(sid: str, data: dict) -> None:
+    """Start WebRTC screen sharing in the current room.
+
+    Client flow:
+      1) sharer emits screen_share_start
+      2) viewers receive screen_share_started
+      3) viewer emits screen_viewer_ready to sharer
+      4) sharer sends screen_offer to viewer
+      5) viewer sends screen_answer back
+      6) both sides exchange screen_ice_candidate
+    """
+    try:
+        if not isinstance(data, dict):
+            data = {}
+        if not await _redis_check_rate(sid, _S_MAX_SCREEN_SIGNAL_RATE, ":signal"):
+            await _emit_screen_error(sid, "RATE_LIMITED", "Screen sharing signaling too fast")
+            return
+
+        room, name = await _get_room_and_name(sid)
+        if not room:
+            await _emit_screen_error(sid, "NOT_IN_ROOM", "Join a room before sharing your screen")
+            return
+
+        current = await _get_screen_state(room)
+        allow_takeover = _safe_bool(data.get("takeover"), False)
+        if current and current.get("sender_sid") != sid and not allow_takeover:
+            await _emit_screen_error(sid, "SCREEN_BUSY", "Another user is already sharing", {"screen_share": current})
+            return
+
+        if current and current.get("sender_sid") != sid and allow_takeover:
+            await _clear_screen_state(room)
+            await sio.emit("screen_share_stopped", {
+                "room": room,
+                "stream_id": current.get("stream_id", ""),
+                "sender_sid": current.get("sender_sid", ""),
+                "reason": "takeover",
+            }, room=room)
+
+        state = {
+            "room": room,
+            "stream_id": _sanitize_stream_id(data.get("stream_id")),
+            "sender_sid": sid,
+            "sender_name": name,
+            "kind": _clean_screen_kind(data.get("kind")),
+            "title": _clean_small_text(data.get("title"), 120),
+            "has_audio": _safe_bool(data.get("has_audio"), False),
+            "started_at": time.time(),
+        }
+        await _set_screen_state(room, state)
+        public_state = _public_screen_state(state)
+        await sio.emit("screen_share_started", public_state, room=room)
+        await sio.emit("screen_share_state", {"screen_share": public_state}, room=room)
+        log.info("   screen_start @%-14s -> %-18s stream=%s", name, room, state["stream_id"][:12])
+    except Exception as exc:
+        log.exception("screen_share_start sid=%s: %s", sid, exc)
+        await _emit_screen_error(sid, "SERVER_ERROR", "Could not start screen sharing")
+
+
+@sio.event
+async def screen_share_stop(sid: str, data: dict) -> None:
+    try:
+        if not isinstance(data, dict):
+            data = {}
+        room, _name = await _get_room_and_name(sid)
+        if not room:
+            return
+        current = await _get_screen_state(room)
+        if not current:
+            await sio.emit("screen_share_state", {"screen_share": None}, to=sid)
+            return
+        if current.get("sender_sid") != sid:
+            await _emit_screen_error(sid, "NOT_OWNER", "Only the active sharer can stop this screen share")
+            return
+        state = await _clear_screen_state(room)
+        await sio.emit("screen_share_stopped", {
+            "room": room,
+            "stream_id": (state or current).get("stream_id", ""),
+            "sender_sid": sid,
+            "reason": _clean_small_text(data.get("reason"), 40) or "stopped",
+        }, room=room)
+        await sio.emit("screen_share_state", {"screen_share": None}, room=room)
+        log.info("   screen_stop sid=%-8s room=%-18s", sid[:8], room)
+    except Exception as exc:
+        log.exception("screen_share_stop sid=%s: %s", sid, exc)
+        await _emit_screen_error(sid, "SERVER_ERROR", "Could not stop screen sharing")
+
+
+@sio.event
+async def screen_share_state(sid: str, data: dict) -> None:
+    try:
+        room, _name = await _get_room_and_name(sid)
+        if not room:
+            await sio.emit("screen_share_state", {"screen_share": None}, to=sid)
+            return
+        await sio.emit("screen_share_state", {"screen_share": await _get_screen_state(room)}, to=sid)
+    except Exception as exc:
+        log.exception("screen_share_state sid=%s: %s", sid, exc)
+
+
+@sio.event
+async def screen_viewer_ready(sid: str, data: dict) -> None:
+    """Viewer asks the active sharer to create an offer for this viewer."""
+    try:
+        if not isinstance(data, dict):
+            data = {}
+        if not await _redis_check_rate(sid, _S_MAX_SCREEN_SIGNAL_RATE, ":signal"):
+            await _emit_screen_error(sid, "RATE_LIMITED", "Screen sharing signaling too fast")
+            return
+
+        room, viewer_name = await _get_room_and_name(sid)
+        if not room:
+            await _emit_screen_error(sid, "NOT_IN_ROOM", "Join a room before watching a screen share")
+            return
+        current = await _get_screen_state(room)
+        if not current:
+            await _emit_screen_error(sid, "NO_ACTIVE_SHARE", "No active screen share in this room")
+            return
+        presenter_sid = current.get("sender_sid", "")
+        if presenter_sid == sid:
+            return
+
+        await sio.emit("screen_viewer_ready", {
+            "viewer_sid": sid,
+            "viewer_name": viewer_name,
+            "stream_id": current.get("stream_id", ""),
+        }, to=presenter_sid)
+    except Exception as exc:
+        log.exception("screen_viewer_ready sid=%s: %s", sid, exc)
+        await _emit_screen_error(sid, "SERVER_ERROR", "Could not request screen share")
+
+
+@sio.event
+async def screen_offer(sid: str, data: dict) -> None:
+    """Relay WebRTC offer from active screen sharer to one viewer."""
+    try:
+        if not isinstance(data, dict):
+            data = {}
+        if not await _redis_check_rate(sid, _S_MAX_SCREEN_SIGNAL_RATE, ":signal"):
+            await _emit_screen_error(sid, "RATE_LIMITED", "Screen sharing signaling too fast")
+            return
+
+        room, name = await _get_room_and_name(sid)
+        target_sid = str(data.get("to") or data.get("target_sid") or "")[:128]
+        sdp = _clean_sdp(data.get("sdp"))
+        offer_type = _clean_webrtc_type(data.get("type"), {"offer"}, "offer")
+        if not room or not target_sid or not sdp:
+            await _emit_screen_error(sid, "BAD_OFFER", "screen_offer needs target_sid/to and valid SDP")
+            return
+        current = await _get_screen_state(room)
+        if not current or current.get("sender_sid") != sid:
+            await _emit_screen_error(sid, "NOT_SHARER", "Only the active screen sharer can send offers")
+            return
+        if not await _sid_in_room(target_sid, room):
+            await _emit_screen_error(sid, "TARGET_NOT_IN_ROOM", "Target viewer is not in your room")
+            return
+
+        await sio.emit("screen_offer", {
+            "from": sid,
+            "from_name": name,
+            "stream_id": current.get("stream_id", ""),
+            "type": offer_type,
+            "sdp": sdp,
+        }, to=target_sid)
+    except Exception as exc:
+        log.exception("screen_offer sid=%s: %s", sid, exc)
+        await _emit_screen_error(sid, "SERVER_ERROR", "Could not relay screen offer")
+
+
+@sio.event
+async def screen_answer(sid: str, data: dict) -> None:
+    """Relay WebRTC answer from viewer to active screen sharer."""
+    try:
+        if not isinstance(data, dict):
+            data = {}
+        if not await _redis_check_rate(sid, _S_MAX_SCREEN_SIGNAL_RATE, ":signal"):
+            await _emit_screen_error(sid, "RATE_LIMITED", "Screen sharing signaling too fast")
+            return
+
+        room, name = await _get_room_and_name(sid)
+        sdp = _clean_sdp(data.get("sdp"))
+        answer_type = _clean_webrtc_type(data.get("type"), {"answer"}, "answer")
+        if not room or not sdp:
+            await _emit_screen_error(sid, "BAD_ANSWER", "screen_answer needs valid SDP")
+            return
+        current = await _get_screen_state(room)
+        if not current:
+            await _emit_screen_error(sid, "NO_ACTIVE_SHARE", "No active screen share in this room")
+            return
+        target_sid = str(data.get("to") or data.get("target_sid") or current.get("sender_sid") or "")[:128]
+        if target_sid == sid or not await _sid_in_room(target_sid, room):
+            await _emit_screen_error(sid, "TARGET_NOT_IN_ROOM", "Target sharer is not in your room")
+            return
+
+        await sio.emit("screen_answer", {
+            "from": sid,
+            "from_name": name,
+            "stream_id": current.get("stream_id", ""),
+            "type": answer_type,
+            "sdp": sdp,
+        }, to=target_sid)
+    except Exception as exc:
+        log.exception("screen_answer sid=%s: %s", sid, exc)
+        await _emit_screen_error(sid, "SERVER_ERROR", "Could not relay screen answer")
+
+
+@sio.event
+async def screen_ice_candidate(sid: str, data: dict) -> None:
+    """Relay one WebRTC ICE candidate between sharer and viewer."""
+    try:
+        if not isinstance(data, dict):
+            data = {}
+        if not await _redis_check_rate(sid, _S_MAX_SCREEN_SIGNAL_RATE, ":signal"):
+            return
+
+        room, name = await _get_room_and_name(sid)
+        target_sid = str(data.get("to") or data.get("target_sid") or "")[:128]
+        candidate = _clean_ice_candidate(data.get("candidate"))
+        if not room or not target_sid or candidate is None:
+            return
+        if target_sid == sid or not await _sid_in_room(target_sid, room):
+            return
+        current = await _get_screen_state(room)
+        stream_id = str(data.get("stream_id") or (current or {}).get("stream_id") or "")[:48]
+
+        await sio.emit("screen_ice_candidate", {
+            "from": sid,
+            "from_name": name,
+            "stream_id": stream_id,
+            "candidate": candidate,
+        }, to=target_sid)
+    except Exception as exc:
+        log.exception("screen_ice_candidate sid=%s: %s", sid, exc)
 
 
 @sio.event

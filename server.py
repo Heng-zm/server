@@ -3,11 +3,14 @@ WalkieTalk — signaling + voice relay server
 FastAPI + python-socketio (ASGI) + Redis pub/sub for multi-instance scale
 
 Environment variables:
-    SUPABASE_URL        = https://bgqeqiyfgpdvgeepignt.supabase.co
-    SUPABASE_KEY        = sb_publishable_eLoAp9t0x-t7id3a-3LUow_SaBM6EC6
-    REDIS_URL           = redis://localhost:6379   (empty = single-instance mode)
-    RENDER_EXTERNAL_URL = set automatically by Render — used for self-ping keepalive
-                          (set SERVER_URL manually on other platforms)
+    SUPABASE_URL          = https://your-project.supabase.co
+    SUPABASE_KEY          = your Supabase anon/service key
+    REDIS_URL             = redis://localhost:6379   (empty = single-instance mode)
+    AI_ASSISTANT_URL      = https://bot-voice-sqnz.onrender.com/ai-assistant
+    AI_CHAT_URL           = optional dedicated text-chat endpoint; empty = use AI_ASSISTANT_URL
+    AI_ASSISTANT_API_KEY  = same value as AI_API_KEY on the bot-voice server
+    RENDER_EXTERNAL_URL   = set automatically by Render — used for self-ping keepalive
+                            (set SERVER_URL manually on other platforms)
 
 Run locally:
     uvicorn server:socket_app --host 0.0.0.0 --port 3000 --reload
@@ -72,6 +75,13 @@ AI_ASSISTANT_URL = os.environ.get("AI_ASSISTANT_URL",
 # Optional text chat endpoint. If empty, the server will try AI_ASSISTANT_URL
 # with a text payload and return a clear setup message if the backend does not support it.
 AI_CHAT_URL = os.environ.get("AI_CHAT_URL", "").strip()
+# Send this key to bot-voice /ai-assistant. It must match AI_API_KEY on that server.
+# Keep AI_CHAT_URL empty when /ai-assistant supports text JSON {"message": "..."}.
+AI_ASSISTANT_API_KEY = (
+    os.environ.get("AI_ASSISTANT_API_KEY")
+    or os.environ.get("AI_API_KEY")
+    or ""
+).strip()
 AI_TIMEOUT_SECS = _env_float("AI_TIMEOUT_SECS", 45.0, 5.0, 120.0)
 AI_CHAT_TIMEOUT_SECS = _env_float("AI_CHAT_TIMEOUT_SECS", AI_TIMEOUT_SECS, 5.0, 120.0)
 
@@ -85,6 +95,19 @@ _SB_HEADERS = {
     "Authorization": f"Bearer {SUPABASE_KEY}",
     "Content-Type":  "application/json",
 }
+
+
+def _ai_headers() -> dict[str, str]:
+    """Headers for the external bot-voice AI assistant endpoint."""
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    if AI_ASSISTANT_API_KEY:
+        # bot-voice /ai-assistant accepts X-Api-Key or Authorization: Bearer.
+        headers["X-Api-Key"] = AI_ASSISTANT_API_KEY
+    return headers
+
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 MAX_ROOM_SIZE   = _env_int("MAX_ROOM_SIZE", 20, 2, 200)
@@ -665,6 +688,13 @@ def _validate_color(raw: object) -> str:
     return s if _COLOR_RE.match(s) else "#007aff"
 
 
+def _strip_data_url_base64(value: object) -> str:
+    """Return plain base64 from either raw base64 or data:<mime>;base64,<payload>."""
+    text = str(value or "").strip()
+    if text.lower().startswith("data:") and "," in text:
+        return text.split(",", 1)[1].strip()
+    return text
+
 
 # ── AI chat helpers ───────────────────────────────────────────────────────────
 def _clean_ai_text(value: object, limit: int = MAX_AI_TEXT_LEN) -> str:
@@ -757,7 +787,12 @@ async def _call_ai_chat_backend(text: str, username: str, room: str, history: li
     try:
         for url in urls:
             try:
-                resp = await client.post(url, json=payload, timeout=AI_CHAT_TIMEOUT_SECS)
+                resp = await client.post(
+                    url,
+                    json=payload,
+                    headers=_ai_headers(),
+                    timeout=AI_CHAT_TIMEOUT_SECS,
+                )
             except httpx.TimeoutException:
                 raise
             except Exception as exc:
@@ -787,10 +822,12 @@ async def _call_ai_chat_backend(text: str, username: str, room: str, history: li
 
     if AI_CHAT_URL:
         raise RuntimeError(last_error or "AI backend returned no usable response")
-    return (
-        "AI voice endpoint is online, but it did not return a text chat reply. "
-        "For text chat, set AI_CHAT_URL to your chat endpoint or update AI_ASSISTANT_URL to accept text payloads."
+    setup_hint = (
+        "AI assistant endpoint did not return a text chat reply. "
+        "Set AI_ASSISTANT_API_KEY to the same value as AI_API_KEY on the bot-voice server, "
+        "or set AI_CHAT_URL to a dedicated text chat endpoint."
     )
+    return f"{setup_hint} Last error: {last_error[:180]}" if last_error else setup_hint
 
 
 async def _build_ai_chat_reply(raw: object) -> dict[str, object]:
@@ -1219,7 +1256,17 @@ async def voice_message(sid: str, data: dict) -> None:
                 try:
                     resp = await client.post(
                         AI_ASSISTANT_URL,
-                        json={"audio": audio, "mime": mime, "username": name, "room": room},
+                        json={
+                            # bot-voice /ai-assistant JSON mode expects audio_base64/audio_mime.
+                            "audio_base64": _strip_data_url_base64(audio),
+                            "audio_mime": mime,
+                            "message": "",
+                            "username": name,
+                            "room": room,
+                            "source": "walkietalk_voice_message",
+                        },
+                        headers=_ai_headers(),
+                        timeout=AI_TIMEOUT_SECS,
                     )
                 finally:
                     if close_client:
@@ -1264,7 +1311,8 @@ async def voice_message(sid: str, data: dict) -> None:
                     )
                     await sio.emit("status_update", {"msg": "AI responded", "cls": "ok"}, to=sid)
                 else:
-                    ai_text = str(res_data.get("text") or "No response")[:120]
+                    ai_text = _extract_ai_reply(res_data) or str(res_data.get("error") or "No response")
+                    ai_text = ai_text[:120]
                     await sio.emit("status_update", {"msg": f"AI text: {ai_text}", "cls": "ok"}, to=sid)
             except httpx.TimeoutException:
                 await sio.emit("status_update", {"msg": "AI timed out", "cls": "err"}, to=sid)

@@ -1,11 +1,14 @@
 """
 WalkieTalk — signaling + voice relay server
-FastAPI + python-socketio (ASGI) + Redis pub/sub for multi-instance scale
+FastAPI + python-socketio (ASGI) + optional Redis state/pubsub for multi-instance scale
 
 Environment variables:
     SUPABASE_URL          = https://your-project.supabase.co
     SUPABASE_KEY          = your Supabase anon/service key
     REDIS_URL             = redis://localhost:6379   (empty = single-instance mode)
+    ENABLE_SOCKETIO_REDIS = false by default; set true only for multi-instance Socket.IO pub/sub
+    SOCKETIO_REDIS_URL    = optional Socket.IO pub/sub Redis URL; defaults to REDIS_URL when enabled
+    REDIS_CIRCUIT_OPEN_SECS = seconds to pause Redis operations after repeated failures
     AI_ASSISTANT_URL      = https://bot-voice-sqnz.onrender.com/ai-assistant
     AI_CHAT_URL           = optional dedicated text-chat endpoint; empty = use AI_ASSISTANT_URL
     AI_ASSISTANT_API_KEY  = same value as AI_API_KEY on the bot-voice server
@@ -75,9 +78,25 @@ def _env_float(name: str, default: float, min_value: float | None = None, max_va
         value = min(max_value, value)
     return value
 
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on", "enable", "enabled"}
+
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
-REDIS_URL    = os.environ.get("REDIS_URL", "")
+REDIS_URL    = os.environ.get("REDIS_URL", "").strip()
+# IMPORTANT: python-socketio's AsyncRedisManager runs a permanent Redis pub/sub
+# listener. When Redis is unstable it logs "Cannot receive from redis..." every
+# second. Keep it disabled for one-worker deployments. Your app-level Redis state
+# below still works and has graceful local fallback. Enable only when you truly run
+# multiple server instances that must share Socket.IO room events.
+ENABLE_SOCKETIO_REDIS = _env_bool("ENABLE_SOCKETIO_REDIS", False)
+SOCKETIO_REDIS_URL = (os.environ.get("SOCKETIO_REDIS_URL") or REDIS_URL).strip()
+SOCKETIO_REDIS_CHANNEL = os.environ.get("SOCKETIO_REDIS_CHANNEL", "walkie_sio").strip() or "walkie_sio"
 AI_ASSISTANT_URL = os.environ.get("AI_ASSISTANT_URL",
     "https://bot-voice-sqnz.onrender.com/ai-assistant")
 # Optional text chat endpoint. If empty, the server will try AI_ASSISTANT_URL
@@ -101,6 +120,8 @@ SUPABASE_RETRY_ATTEMPTS = _env_int("SUPABASE_RETRY_ATTEMPTS", 3, 1, 6)
 SUPABASE_RETRY_BASE_DELAY = _env_float("SUPABASE_RETRY_BASE_DELAY", 0.35, 0.05, 5.0)
 REDIS_RETRY_ATTEMPTS = _env_int("REDIS_RETRY_ATTEMPTS", 2, 1, 4)
 REDIS_RETRY_BASE_DELAY = _env_float("REDIS_RETRY_BASE_DELAY", 0.12, 0.02, 2.0)
+REDIS_FAILURE_THRESHOLD = _env_int("REDIS_FAILURE_THRESHOLD", 3, 1, 20)
+REDIS_CIRCUIT_OPEN_SECS = _env_float("REDIS_CIRCUIT_OPEN_SECS", 15.0, 1.0, 300.0)
 LOCAL_STATE_MAX_SIDS = _env_int("LOCAL_STATE_MAX_SIDS", 50_000, 1_000, 500_000)
 LOCAL_RATE_MAX_SIDS = _env_int("LOCAL_RATE_MAX_SIDS", 50_000, 1_000, 500_000)
 
@@ -259,6 +280,8 @@ return {room, name or '', joined or ''}
 _http:  httpx.AsyncClient | None = None
 _ai_http: httpx.AsyncClient | None = None
 _redis                           = None
+_redis_circuit_open_until: float = 0.0
+_redis_consecutive_failures: int = 0
 _last_redis_fallback_log: dict[str, float] = {}
 _last_supabase_error_log: dict[str, float] = {}
 
@@ -279,6 +302,30 @@ def _log_redis_fallback(context: str, exc: Exception) -> None:
         "Redis %s failed; using local fallback where safe: %s",
         context, exc,
     )
+
+
+def _redis_mark_success() -> None:
+    global _redis_consecutive_failures, _redis_circuit_open_until
+    _redis_consecutive_failures = 0
+    _redis_circuit_open_until = 0.0
+
+
+def _redis_mark_failure(context: str, exc: BaseException) -> None:
+    global _redis_consecutive_failures, _redis_circuit_open_until
+    _redis_consecutive_failures += 1
+    if _redis_consecutive_failures >= REDIS_FAILURE_THRESHOLD:
+        _redis_circuit_open_until = time.time() + REDIS_CIRCUIT_OPEN_SECS
+        _throttled_warning(
+            _last_redis_fallback_log,
+            "redis_circuit",
+            "Redis circuit opened for %.1fs after %d failure(s); using local fallback. Last context=%s error=%s",
+            REDIS_CIRCUIT_OPEN_SECS, _redis_consecutive_failures, context, exc,
+            every=REDIS_CIRCUIT_OPEN_SECS,
+        )
+
+
+def _redis_circuit_is_open() -> bool:
+    return bool(_redis_circuit_open_until and time.time() < _redis_circuit_open_until)
 
 
 def _is_retryable_http_status(status_code: int) -> bool:
@@ -348,21 +395,25 @@ async def _supabase_request(method: str, path: str, *, context: str = "supabase"
 
 
 async def _redis_op(context: str, factory, default=None, *, attempts: int | None = None):
-    """Run a Redis operation with small retry/backoff and local fallback."""
-    if not _redis:
+    """Run a Redis operation with bounded retry, circuit breaker, and local fallback."""
+    if not _redis or _redis_circuit_is_open():
         return default
     max_attempts = attempts or REDIS_RETRY_ATTEMPTS
     last_exc: BaseException | None = None
     for attempt in range(1, max_attempts + 1):
         try:
-            return await factory()
+            result = await factory()
+            _redis_mark_success()
+            return result
         except Exception as exc:
             last_exc = exc
             if attempt >= max_attempts or not _is_retryable_exception(exc):
+                _redis_mark_failure(context, exc)
                 _log_redis_fallback(context, exc)
                 return default
             await _backoff_sleep(attempt, REDIS_RETRY_BASE_DELAY)
     if last_exc:
+        _redis_mark_failure(context, last_exc)
         _log_redis_fallback(context, last_exc)
     return default
 
@@ -597,6 +648,7 @@ async def _lifespan(app: FastAPI):
                 decode_responses=True,
                 socket_connect_timeout=5,
                 socket_timeout=5,
+                socket_keepalive=True,
                 retry_on_timeout=True,
                 health_check_interval=30,
             )
@@ -645,7 +697,11 @@ async def _lifespan(app: FastAPI):
         except Exception as exc:
             log.warning("Redis cleanup error: %s", exc)
         finally:
-            await _redis.aclose()
+            close = getattr(_redis, "aclose", None) or getattr(_redis, "close", None)
+            if close:
+                result = close()
+                if asyncio.iscoroutine(result):
+                    await result
 
     if _ai_http:
         await _ai_http.aclose()
@@ -665,13 +721,27 @@ def _build_sio() -> socketio.AsyncServer:
         logger=False,
         engineio_logger=False,
     )
-    if REDIS_URL:
+
+    # Do NOT automatically attach AsyncRedisManager just because REDIS_URL exists.
+    # Its pub/sub listener is the source of repeated logs like:
+    # "Cannot receive from redis... retrying in 1 secs".
+    # For the recommended Render/Railway start command with --workers 1, the
+    # built-in memory manager is faster and safer. Enable this only for true
+    # multi-instance Socket.IO deployments.
+    if ENABLE_SOCKETIO_REDIS and SOCKETIO_REDIS_URL:
         try:
-            mgr = socketio.AsyncRedisManager(REDIS_URL, channel="walkie_sio")
-            log.info("AsyncRedisManager ready")
+            mgr = socketio.AsyncRedisManager(
+                SOCKETIO_REDIS_URL,
+                channel=SOCKETIO_REDIS_CHANNEL,
+                write_only=False,
+            )
+            log.info("Socket.IO Redis pub/sub enabled  channel=%s", SOCKETIO_REDIS_CHANNEL)
             return socketio.AsyncServer(client_manager=mgr, **common)
         except Exception as exc:
-            log.warning("AsyncRedisManager failed (%s) — memory manager", exc)
+            log.warning("Socket.IO Redis pub/sub disabled after init failure (%s) — memory manager", exc)
+
+    if REDIS_URL and not ENABLE_SOCKETIO_REDIS:
+        log.info("Socket.IO Redis pub/sub disabled; app Redis state/fallback still available")
     return socketio.AsyncServer(**common)
 
 
@@ -1445,6 +1515,8 @@ async def root() -> JSONResponse:
             "sdp_sanitizer": True,
             "supabase_retry": True,
             "redis_fallback": True,
+            "redis_circuit_breaker": True,
+            "socketio_redis_pubsub": bool(ENABLE_SOCKETIO_REDIS and SOCKETIO_REDIS_URL),
             "runtime_stats": True,
         },
         "screen_share_events": [
@@ -1458,11 +1530,7 @@ async def health() -> JSONResponse:
     global _last_ping_ok, _last_ping_time
     now = time.time()
     if _redis and (now - _last_ping_time) > _PING_CACHE_TTL:
-        try:
-            await _redis.ping()
-            _last_ping_ok = True
-        except Exception:
-            _last_ping_ok = False
+        _last_ping_ok = bool(await _redis_op("health_ping", lambda: _redis.ping(), default=False, attempts=1))
         _last_ping_time = now
 
     # Snapshot local state once — avoid repeated dict access
@@ -1477,6 +1545,9 @@ async def health() -> JSONResponse:
         "rooms_local": rooms,
         "screen_shares_local": screens,
         "redis":       _last_ping_ok if _redis else None,
+        "redis_circuit_open": _redis_circuit_is_open(),
+        "redis_consecutive_failures": _redis_consecutive_failures,
+        "socketio_redis_pubsub": bool(ENABLE_SOCKETIO_REDIS and SOCKETIO_REDIS_URL),
         "supabase_configured": bool(SUPABASE_URL and SUPABASE_KEY),
         "ai_configured": bool(AI_CHAT_URL or AI_ASSISTANT_URL),
         "ai_key_configured": bool(AI_ASSISTANT_API_KEY),
@@ -1489,11 +1560,7 @@ async def ready() -> JSONResponse:
     """Readiness endpoint for deployment health checks."""
     redis_ok = None
     if _redis:
-        try:
-            await _redis.ping()
-            redis_ok = True
-        except Exception:
-            redis_ok = False
+        redis_ok = bool(await _redis_op("ready_ping", lambda: _redis.ping(), default=False, attempts=1))
 
     supabase_ok = None
     if SUPABASE_URL and SUPABASE_KEY and _http:
@@ -1531,6 +1598,9 @@ async def stats() -> JSONResponse:
             "ai": len(_local_ai_times),
         },
         "redis_enabled": bool(_redis),
+        "redis_circuit_open": _redis_circuit_is_open(),
+        "redis_consecutive_failures": _redis_consecutive_failures,
+        "socketio_redis_pubsub": bool(ENABLE_SOCKETIO_REDIS and SOCKETIO_REDIS_URL),
         "supabase_enabled": bool(_http),
     })
 

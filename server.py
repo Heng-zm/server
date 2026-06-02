@@ -31,6 +31,7 @@ Deploy (Render / Railway):
 import asyncio
 import logging
 import os
+import random
 import re
 import time
 from collections import deque
@@ -74,10 +75,8 @@ def _env_float(name: str, default: float, min_value: float | None = None, max_va
         value = min(max_value, value)
     return value
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL",
-    "https://bgqeqiyfgpdvgeepignt.supabase.co").rstrip("/")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY",
-    "sb_publishable_eLoAp9t0x-t7id3a-3LUow_SaBM6EC6")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 REDIS_URL    = os.environ.get("REDIS_URL", "")
 AI_ASSISTANT_URL = os.environ.get("AI_ASSISTANT_URL",
     "https://bot-voice-sqnz.onrender.com/ai-assistant")
@@ -93,6 +92,18 @@ AI_ASSISTANT_API_KEY = (
 ).strip()
 AI_TIMEOUT_SECS = _env_float("AI_TIMEOUT_SECS", 45.0, 5.0, 120.0)
 AI_CHAT_TIMEOUT_SECS = _env_float("AI_CHAT_TIMEOUT_SECS", AI_TIMEOUT_SECS, 5.0, 120.0)
+AI_RETRY_ATTEMPTS = _env_int("AI_RETRY_ATTEMPTS", 2, 1, 5)
+AI_RETRY_BASE_DELAY = _env_float("AI_RETRY_BASE_DELAY", 0.45, 0.05, 5.0)
+
+# Retry / resilience tuning
+SUPABASE_TIMEOUT_SECS = _env_float("SUPABASE_TIMEOUT_SECS", 10.0, 3.0, 60.0)
+SUPABASE_RETRY_ATTEMPTS = _env_int("SUPABASE_RETRY_ATTEMPTS", 3, 1, 6)
+SUPABASE_RETRY_BASE_DELAY = _env_float("SUPABASE_RETRY_BASE_DELAY", 0.35, 0.05, 5.0)
+REDIS_RETRY_ATTEMPTS = _env_int("REDIS_RETRY_ATTEMPTS", 2, 1, 4)
+REDIS_RETRY_BASE_DELAY = _env_float("REDIS_RETRY_BASE_DELAY", 0.12, 0.02, 2.0)
+LOCAL_STATE_MAX_SIDS = _env_int("LOCAL_STATE_MAX_SIDS", 50_000, 1_000, 500_000)
+LOCAL_RATE_MAX_SIDS = _env_int("LOCAL_RATE_MAX_SIDS", 50_000, 1_000, 500_000)
+
 
 KEEPALIVE_URL = (
     os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
@@ -248,19 +259,112 @@ return {room, name or '', joined or ''}
 _http:  httpx.AsyncClient | None = None
 _ai_http: httpx.AsyncClient | None = None
 _redis                           = None
-_last_redis_fallback_log: float = 0.0
+_last_redis_fallback_log: dict[str, float] = {}
+_last_supabase_error_log: dict[str, float] = {}
+
+
+def _throttled_warning(bucket: dict[str, float], key: str, message: str, *args, every: float = 30.0) -> None:
+    """Log repeated transient failures without flooding Render logs."""
+    now = time.time()
+    if now - bucket.get(key, 0.0) >= every:
+        bucket[key] = now
+        log.warning(message, *args)
 
 
 def _log_redis_fallback(context: str, exc: Exception) -> None:
     """Log Redis failures without flooding logs during a transient outage."""
-    global _last_redis_fallback_log
-    now = time.time()
-    if now - _last_redis_fallback_log >= 30.0:
-        _last_redis_fallback_log = now
-        log.warning(
-            "Redis %s failed; using local fallback where safe: %s",
-            context, exc,
-        )
+    _throttled_warning(
+        _last_redis_fallback_log,
+        context,
+        "Redis %s failed; using local fallback where safe: %s",
+        context, exc,
+    )
+
+
+def _is_retryable_http_status(status_code: int) -> bool:
+    return status_code in {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def _is_retryable_exception(exc: BaseException) -> bool:
+    if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError, httpx.RemoteProtocolError)):
+        return True
+    msg = str(exc).lower()
+    return any(part in msg for part in (
+        "timeout", "timed out", "connection reset", "connection refused",
+        "server disconnected", "temporarily unavailable", "temporary failure",
+        "name resolution", "dns", "network", "too many requests",
+    ))
+
+
+async def _backoff_sleep(attempt: int, base_delay: float) -> None:
+    delay = min(4.0, base_delay * (2 ** max(0, attempt - 1))) + random.uniform(0, base_delay)
+    await asyncio.sleep(delay)
+
+
+async def _supabase_request(method: str, path: str, *, context: str = "supabase", **kwargs) -> httpx.Response:
+    """Supabase HTTP helper with retry/backoff for temporary failures."""
+    if _http is None:
+        raise RuntimeError("Supabase HTTP client is not ready")
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("SUPABASE_URL/SUPABASE_KEY not configured")
+
+    last_exc: BaseException | None = None
+    method = method.upper()
+    for attempt in range(1, SUPABASE_RETRY_ATTEMPTS + 1):
+        try:
+            resp = await _http.request(method, path, **kwargs)
+            if not _is_retryable_http_status(resp.status_code) or attempt >= SUPABASE_RETRY_ATTEMPTS:
+                if _is_retryable_http_status(resp.status_code) and attempt >= SUPABASE_RETRY_ATTEMPTS:
+                    _throttled_warning(
+                        _last_supabase_error_log, context,
+                        "Supabase %s %s failed after %d attempt(s): HTTP %s %s",
+                        method, path, attempt, resp.status_code, resp.text[:180],
+                    )
+                return resp
+            _throttled_warning(
+                _last_supabase_error_log, context,
+                "Supabase %s temporary HTTP %s for %s; retrying",
+                method, resp.status_code, context, every=10.0,
+            )
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= SUPABASE_RETRY_ATTEMPTS or not _is_retryable_exception(exc):
+                _throttled_warning(
+                    _last_supabase_error_log, context,
+                    "Supabase %s %s failed after %d attempt(s): %s",
+                    method, path, attempt, exc,
+                )
+                raise
+            _throttled_warning(
+                _last_supabase_error_log, context,
+                "Supabase %s temporary error for %s: %s; retrying",
+                method, context, exc, every=10.0,
+            )
+        await _backoff_sleep(attempt, SUPABASE_RETRY_BASE_DELAY)
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"Supabase {method} {path} failed")
+
+
+async def _redis_op(context: str, factory, default=None, *, attempts: int | None = None):
+    """Run a Redis operation with small retry/backoff and local fallback."""
+    if not _redis:
+        return default
+    max_attempts = attempts or REDIS_RETRY_ATTEMPTS
+    last_exc: BaseException | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await factory()
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= max_attempts or not _is_retryable_exception(exc):
+                _log_redis_fallback(context, exc)
+                return default
+            await _backoff_sleep(attempt, REDIS_RETRY_BASE_DELAY)
+    if last_exc:
+        _log_redis_fallback(context, last_exc)
+    return default
 
 
 # ── Local in-memory state ──────────────────────────────────────────────────────
@@ -271,6 +375,28 @@ _local_chunk_times: dict[str, deque[float]] = {}    # live audio chunk rate
 _local_signal_times: dict[str, deque[float]] = {}   # WebRTC signaling rate
 _local_ai_times: dict[str, deque[float]] = {}       # AI chat rate
 _local_screens: dict[str, dict] = {}                # room -> active screen share state
+
+
+def _cap_local_state() -> None:
+    """Prevent memory growth if many short-lived socket IDs hit fallback mode."""
+    if len(_local_users) > LOCAL_STATE_MAX_SIDS:
+        for sid in list(_local_users)[: len(_local_users) - LOCAL_STATE_MAX_SIDS]:
+            info = _local_users.pop(sid, None) or {}
+            room = info.get("room")
+            if room in _local_rooms:
+                _local_rooms[room].discard(sid)
+                if not _local_rooms[room]:
+                    _local_rooms.pop(room, None)
+            _local_msg_times.pop(sid, None)
+            _local_chunk_times.pop(sid, None)
+            _local_signal_times.pop(sid, None)
+            _local_ai_times.pop(sid, None)
+
+
+def _cap_rate_store(store: dict[str, deque[float]]) -> None:
+    if len(store) > LOCAL_RATE_MAX_SIDS:
+        for key in list(store)[: len(store) - LOCAL_RATE_MAX_SIDS]:
+            store.pop(key, None)
 
 INSTANCE_ID = f"inst_{os.getpid()}_{int(time.time()) % 10000}"
 
@@ -378,8 +504,10 @@ async def _zone_expiry_task() -> None:
         if _http is None:
             continue
         try:
-            r = await _http.delete(
+            r = await _supabase_request(
+                "DELETE",
                 "/rest/v1/geo_zones",
+                context="zone_expiry",
                 params={"expires_at": "lt.now()"},
                 headers={"Prefer": "return=representation"},
             )
@@ -437,17 +565,25 @@ async def _keepalive_task() -> None:
 async def _lifespan(app: FastAPI):
     global _http, _ai_http, _redis
 
-    _http = httpx.AsyncClient(
-        base_url=SUPABASE_URL,
-        headers=_SB_HEADERS,
-        timeout=10.0,
-        limits=httpx.Limits(
-            max_connections=20,
-            max_keepalive_connections=5,
-            keepalive_expiry=30,
-        ),
+    if SUPABASE_URL and SUPABASE_KEY:
+        _http = httpx.AsyncClient(
+            base_url=SUPABASE_URL,
+            headers=_SB_HEADERS,
+            timeout=SUPABASE_TIMEOUT_SECS,
+            limits=httpx.Limits(
+                max_connections=30,
+                max_keepalive_connections=10,
+                keepalive_expiry=30,
+            ),
+        )
+    else:
+        _http = None
+        log.warning("SUPABASE_URL/SUPABASE_KEY missing — geo_zones API will return 503 until configured")
+
+    _ai_http = httpx.AsyncClient(
+        timeout=AI_TIMEOUT_SECS,
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=8, keepalive_expiry=30),
     )
-    _ai_http = httpx.AsyncClient(timeout=AI_TIMEOUT_SECS)
 
     if REDIS_URL:
         try:
@@ -461,6 +597,8 @@ async def _lifespan(app: FastAPI):
                 decode_responses=True,
                 socket_connect_timeout=5,
                 socket_timeout=5,
+                retry_on_timeout=True,
+                health_check_interval=30,
             )
             await _redis.ping()
             log.info("Redis connected  url=%s  instance=%s", REDIS_URL[:40], INSTANCE_ID)
@@ -495,10 +633,10 @@ async def _lifespan(app: FastAPI):
 
     if _redis:
         try:
-            all_presence = await _redis.hgetall(_RK_PRESENCE)
+            all_presence = await _redis_op("shutdown_presence", lambda: _redis.hgetall(_RK_PRESENCE), default={})
             mine = [s for s, iid in all_presence.items() if iid == INSTANCE_ID]
             if mine:
-                await _redis.hdel(_RK_PRESENCE, *mine)
+                await _redis_op("shutdown_hdel_presence", lambda: _redis.hdel(_RK_PRESENCE, *mine), default=None)
                 await asyncio.gather(
                     *[_redis_leave(sid, known_room=None) for sid in mine],
                     return_exceptions=True,
@@ -552,34 +690,65 @@ socket_app = socketio.ASGIApp(sio, app)
 
 # ── Redis helpers ─────────────────────────────────────────────────────────────
 
+async def _redis_prune_room(room: str) -> int:
+    """Remove stale socket IDs from a Redis room set. Returns removed count."""
+    if not _redis or not room:
+        return 0
+    try:
+        sids = list(await _redis.smembers(_RK_ROOM + room) or [])
+        if not sids:
+            return 0
+        pipe = _redis.pipeline(transaction=False)
+        for sid in sids:
+            pipe.exists(_RK_USER + sid)
+        exists = await pipe.execute()
+        stale = [sid for sid, ok in zip(sids, exists) if not ok]
+        if stale:
+            await _redis.srem(_RK_ROOM + room, *stale)
+            await _redis.hdel(_RK_PRESENCE, *stale)
+        return len(stale)
+    except Exception as exc:
+        _log_redis_fallback("prune_room", exc)
+        return 0
+
 async def _redis_atomic_join(sid: str, room: str, name: str) -> bool:
     now_ts = time.time()
     if not _redis:
         if len(_local_rooms.get(room, set())) >= MAX_ROOM_SIZE:
             return False
-        # joined_at stored as float — consistent with Redis path
         _local_users[sid] = {"room": room, "name": name, "joined_at": now_ts}
         _local_rooms.setdefault(room, set()).add(sid)
+        _cap_local_state()
         return True
 
-    try:
-        result = await _redis.eval(
+    async def _join_once():
+        return await _redis.eval(
             _LUA_JOIN, 3,
             _RK_ROOM + room, _RK_USER + sid, _RK_PRESENCE,
             sid, room, name,
             _S_MAX_ROOM, f"{now_ts:.3f}", INSTANCE_ID, _S_USER_TTL,
         )
-        admitted = bool(result)
-    except Exception as exc:
-        _log_redis_fallback("join", exc)
+
+    result = await _redis_op("join", _join_once, default=None)
+    admitted = bool(result)
+
+    # If Redis thinks the room is full, prune stale sockets once and retry.
+    if result == 0:
+        removed = await _redis_prune_room(room)
+        if removed:
+            result = await _redis_op("join_retry_after_prune", _join_once, default=0)
+            admitted = bool(result)
+
+    if not admitted and result is None:
+        # Redis outage fallback. Room size is best-effort in single instance mode.
         if len(_local_rooms.get(room, set())) >= MAX_ROOM_SIZE:
             return False
         admitted = True
 
     if admitted:
-        # Mirror in local state — float consistent with local path
         _local_users[sid] = {"room": room, "name": name, "joined_at": now_ts}
         _local_rooms.setdefault(room, set()).add(sid)
+        _cap_local_state()
     return admitted
 
 
@@ -587,15 +756,14 @@ async def _redis_leave(sid: str, known_room: str | None) -> tuple[str | None, st
     if not _redis:
         return None, sid[:6], None
 
-    try:
-        result = await _redis.eval(
+    async def _leave_once():
+        return await _redis.eval(
             _LUA_LEAVE, 2,
             _RK_USER + sid, _RK_PRESENCE,
             sid, _RK_ROOM,
         )
-    except Exception as exc:
-        _log_redis_fallback("leave", exc)
-        return known_room, sid[:6], None
+
+    result = await _redis_op("leave", _leave_once, default=None)
     if not result or result[0] is None:
         return known_room, sid[:6], None
     return result[0] or known_room, result[1] or sid[:6], result[2] or None
@@ -604,19 +772,30 @@ async def _redis_leave(sid: str, known_room: str | None) -> tuple[str | None, st
 async def _redis_room_members(room: str) -> list[dict]:
     if not _redis:
         return _local_room_members(room)
-    try:
+
+    async def _members_once():
         sids = await _redis.smembers(_RK_ROOM + room)
         if not sids:
             return []
-        sids = list(sids)[:MAX_ROOM_SIZE]
+        sids = list(sids)[:MAX_ROOM_SIZE * 2]
         pipe = _redis.pipeline(transaction=False)
         for sid in sids:
             pipe.hget(_RK_USER + sid, "name")
         names = await pipe.execute()
-        return [{"sid": s, "name": n} for s, n in zip(sids, names) if n]
-    except Exception as exc:
-        _log_redis_fallback("room_members", exc)
-        return _local_room_members(room)
+        members = []
+        stale = []
+        for sid, nm in zip(sids, names):
+            if nm:
+                members.append({"sid": sid, "name": nm})
+            else:
+                stale.append(sid)
+        if stale:
+            await _redis.srem(_RK_ROOM + room, *stale)
+            await _redis.hdel(_RK_PRESENCE, *stale)
+        return members[:MAX_ROOM_SIZE]
+
+    result = await _redis_op("room_members", _members_once, default=None)
+    return result if result is not None else _local_room_members(room)
 
 
 async def _redis_check_rate(sid: str, limit_str: str | None = None, key_suffix: str = "") -> bool:
@@ -634,20 +813,21 @@ async def _redis_check_rate(sid: str, limit_str: str | None = None, key_suffix: 
     now    = time.time()
     cutoff = now - MSG_RATE_WINDOW
     key    = _RK_RATE + sid + key_suffix
-    # Append 4 random hex chars so concurrent coroutines never collide on the same member
     member = f"{now:.6f}:{os.urandom(2).hex()}"
 
-    try:
-        result = await _redis.eval(
+    async def _rate_once():
+        return await _redis.eval(
             _LUA_RATE, 1,
             key,
             f"{cutoff:.6f}", member, f"{now:.6f}",
             _limit, _S_RATE_TTL,
         )
-        return bool(result)
-    except Exception as exc:
-        _log_redis_fallback("rate_limit", exc)
+
+    result = await _redis_op("rate_limit" + key_suffix, _rate_once, default=None, attempts=1)
+    if result is None:
         return _local_check_rate(sid, int(_limit), key_suffix)
+    return bool(result)
+
 
 
 # ── Unified leave ─────────────────────────────────────────────────────────────
@@ -717,6 +897,7 @@ def _local_check_rate(sid: str, limit: int, key_suffix: str = "") -> bool:
     if times is None:
         times = deque()   # no maxlen — cutoff loop is the eviction mechanism
         store[sid] = times
+        _cap_rate_store(store)
     while times and times[0] <= cutoff:
         times.popleft()
     if len(times) >= limit:
@@ -732,10 +913,7 @@ async def _get_room_fast(sid: str) -> str | None:
     if info:
         return info.get("room")
     if _redis:
-        try:
-            return await _redis.hget(_RK_USER + sid, "room")
-        except Exception as exc:
-            _log_redis_fallback("get_room", exc)
+        return await _redis_op("get_room", lambda: _redis.hget(_RK_USER + sid, "room"), default=None, attempts=1)
     return None
 
 
@@ -749,12 +927,14 @@ async def _get_room_and_name(sid: str) -> tuple[str | None, str]:
     if info:
         return info.get("room"), info.get("name", sid[:6])
     if _redis:
-        # Single pipeline call — halves Redis latency vs two sequential hget
-        try:
-            vals = await _redis.hmget(_RK_USER + sid, "room", "name")
+        vals = await _redis_op(
+            "get_room_name",
+            lambda: _redis.hmget(_RK_USER + sid, "room", "name"),
+            default=None,
+            attempts=1,
+        )
+        if vals:
             return vals[0], (vals[1] or sid[:6])
-        except Exception as exc:
-            _log_redis_fallback("get_room_name", exc)
     return None, sid[:6]
 
 
@@ -949,12 +1129,15 @@ async def _get_screen_state(room: str) -> dict | None:
             return _public_screen_state(state)
         _local_screens.pop(room, None)
     if _redis:
-        try:
-            raw = await _redis.hgetall(_RK_SCREEN + room)
-        except Exception as exc:
-            _log_redis_fallback("get_screen_state", exc)
-            raw = {}
+        raw = await _redis_op("get_screen_state", lambda: _redis.hgetall(_RK_SCREEN + room), default={})
         if raw:
+            try:
+                started_at = float(raw.get("started_at") or 0.0)
+            except (TypeError, ValueError):
+                started_at = 0.0
+            if started_at and (time.time() - started_at) > SCREEN_STATE_TTL:
+                await _redis_op("expire_stale_screen_state", lambda: _redis.delete(_RK_SCREEN + room), default=None)
+                return None
             state = {
                 "room": room,
                 "stream_id": raw.get("stream_id", ""),
@@ -963,7 +1146,7 @@ async def _get_screen_state(room: str) -> dict | None:
                 "kind": raw.get("kind", "screen"),
                 "title": raw.get("title", ""),
                 "has_audio": raw.get("has_audio") == "1",
-                "started_at": float(raw.get("started_at") or 0.0),
+                "started_at": started_at,
             }
             _local_screens[room] = state
             return _public_screen_state(state)
@@ -974,7 +1157,8 @@ async def _set_screen_state(room: str, state: dict) -> None:
     _local_screens[room] = state
     if _redis:
         key = _RK_SCREEN + room
-        try:
+
+        async def _set_once():
             await _redis.hset(key, mapping={
                 "room": room,
                 "stream_id": state["stream_id"],
@@ -986,20 +1170,24 @@ async def _set_screen_state(room: str, state: dict) -> None:
                 "started_at": f"{float(state.get('started_at') or time.time()):.3f}",
             })
             await _redis.expire(key, SCREEN_STATE_TTL)
-        except Exception as exc:
-            _log_redis_fallback("set_screen_state", exc)
+
+        await _redis_op("set_screen_state", _set_once, default=None)
 
 
 async def _clear_screen_state(room: str) -> dict | None:
     state = _local_screens.pop(room, None)
     if _redis:
-        try:
+        async def _clear_once():
             raw = await _redis.hgetall(_RK_SCREEN + room)
             await _redis.delete(_RK_SCREEN + room)
-        except Exception as exc:
-            _log_redis_fallback("clear_screen_state", exc)
-            raw = {}
+            return raw
+
+        raw = await _redis_op("clear_screen_state", _clear_once, default={})
         if raw and not state:
+            try:
+                started_at = float(raw.get("started_at") or 0.0)
+            except (TypeError, ValueError):
+                started_at = 0.0
             state = {
                 "room": room,
                 "stream_id": raw.get("stream_id", ""),
@@ -1008,7 +1196,7 @@ async def _clear_screen_state(room: str) -> dict | None:
                 "kind": raw.get("kind", "screen"),
                 "title": raw.get("title", ""),
                 "has_audio": raw.get("has_audio") == "1",
-                "started_at": float(raw.get("started_at") or 0.0),
+                "started_at": started_at,
             }
     return _public_screen_state(state)
 
@@ -1020,11 +1208,8 @@ async def _sid_in_room(target_sid: str, room: str) -> bool:
     if info and info.get("room") == room:
         return True
     if _redis:
-        try:
-            target_room = await _redis.hget(_RK_USER + target_sid, "room")
-            return target_room == room
-        except Exception as exc:
-            _log_redis_fallback("sid_in_room", exc)
+        target_room = await _redis_op("sid_in_room", lambda: _redis.hget(_RK_USER + target_sid, "room"), default=None, attempts=1)
+        return target_room == room
     return False
 
 
@@ -1123,6 +1308,33 @@ def _extract_ai_reply(payload: object) -> str:
     return ""
 
 
+async def _post_ai_json(url: str, payload: dict, *, timeout: float) -> httpx.Response:
+    """POST JSON to AI backend with bounded retries for temporary network/server errors."""
+    client = _ai_http or httpx.AsyncClient(timeout=timeout)
+    close_client = _ai_http is None
+    last_exc: BaseException | None = None
+    try:
+        for attempt in range(1, AI_RETRY_ATTEMPTS + 1):
+            try:
+                resp = await client.post(url, json=payload, headers=_ai_headers(), timeout=timeout)
+                if not _is_retryable_http_status(resp.status_code) or attempt >= AI_RETRY_ATTEMPTS:
+                    return resp
+                await _backoff_sleep(attempt, AI_RETRY_BASE_DELAY)
+            except httpx.TimeoutException:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= AI_RETRY_ATTEMPTS or not _is_retryable_exception(exc):
+                    raise
+                await _backoff_sleep(attempt, AI_RETRY_BASE_DELAY)
+    finally:
+        if close_client:
+            await client.aclose()
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("AI backend request failed")
+
+
 async def _call_ai_chat_backend(text: str, username: str, room: str, history: list[dict[str, str]]) -> str:
     """Call a configurable text-AI endpoint and normalize its response."""
     urls: list[str] = []
@@ -1138,6 +1350,12 @@ async def _call_ai_chat_backend(text: str, username: str, room: str, history: li
             "AI chat backend is not configured yet. Set AI_CHAT_URL to a POST endpoint "
             "that accepts JSON {text, message, username, room, history} and returns {text}."
         )
+    if not AI_ASSISTANT_API_KEY and not AI_CHAT_URL and AI_ASSISTANT_URL:
+        return (
+            "AI assistant API key is missing. Set AI_ASSISTANT_API_KEY to the same "
+            "value as AI_API_KEY on the bot-voice server, or set AI_CHAT_URL to a "
+            "text endpoint that does not require that key."
+        )
 
     payload = {
         "text": text,
@@ -1150,43 +1368,32 @@ async def _call_ai_chat_backend(text: str, username: str, room: str, history: li
     }
 
     last_error = ""
-    client = _ai_http or httpx.AsyncClient(timeout=AI_CHAT_TIMEOUT_SECS)
-    close_client = _ai_http is None
-    try:
-        for url in urls:
-            try:
-                resp = await client.post(
-                    url,
-                    json=payload,
-                    headers=_ai_headers(),
-                    timeout=AI_CHAT_TIMEOUT_SECS,
-                )
-            except httpx.TimeoutException:
-                raise
-            except Exception as exc:
-                last_error = str(exc)
-                continue
+    for url in urls:
+        try:
+            resp = await _post_ai_json(url, payload, timeout=AI_CHAT_TIMEOUT_SECS)
+        except httpx.TimeoutException:
+            raise
+        except Exception as exc:
+            last_error = str(exc)
+            continue
 
-            if not resp.is_success:
-                last_error = f"AI backend HTTP {resp.status_code}: {resp.text[:180]}"
-                continue
+        if not resp.is_success:
+            last_error = f"AI backend HTTP {resp.status_code}: {resp.text[:180]}"
+            continue
 
-            try:
-                data = resp.json()
-            except ValueError:
-                reply = _clean_ai_text(resp.text, 6000)
-                if reply:
-                    return reply
-                last_error = "AI backend returned empty non-JSON response"
-                continue
-
-            reply = _extract_ai_reply(data)
+        try:
+            data = resp.json()
+        except ValueError:
+            reply = _clean_ai_text(resp.text, 6000)
             if reply:
                 return reply
-            last_error = "AI backend returned JSON without text/reply/response"
-    finally:
-        if close_client:
-            await client.aclose()
+            last_error = "AI backend returned empty non-JSON response"
+            continue
+
+        reply = _extract_ai_reply(data)
+        if reply:
+            return reply
+        last_error = "AI backend returned JSON without text/reply/response"
 
     if AI_CHAT_URL:
         raise RuntimeError(last_error or "AI backend returned no usable response")
@@ -1224,6 +1431,8 @@ async def root() -> JSONResponse:
         "name": "WalkieTalk",
         "status": "ok",
         "health": "/health",
+        "ready": "/ready",
+        "stats": "/stats",
         "zones": "/zones",
         "ai_chat": "/ai/chat",
         "socketio_path": "/socket.io",
@@ -1234,6 +1443,9 @@ async def root() -> JSONResponse:
             "geo_zones": True,
             "screen_share_signaling": True,
             "sdp_sanitizer": True,
+            "supabase_retry": True,
+            "redis_fallback": True,
+            "runtime_stats": True,
         },
         "screen_share_events": [
             "screen_share_start", "screen_share_stop", "screen_share_state",
@@ -1265,9 +1477,62 @@ async def health() -> JSONResponse:
         "rooms_local": rooms,
         "screen_shares_local": screens,
         "redis":       _last_ping_ok if _redis else None,
+        "supabase_configured": bool(SUPABASE_URL and SUPABASE_KEY),
+        "ai_configured": bool(AI_CHAT_URL or AI_ASSISTANT_URL),
+        "ai_key_configured": bool(AI_ASSISTANT_API_KEY),
         "uptime_s":    round(now - _start_time),
     })
 
+
+@app.get("/ready")
+async def ready() -> JSONResponse:
+    """Readiness endpoint for deployment health checks."""
+    redis_ok = None
+    if _redis:
+        try:
+            await _redis.ping()
+            redis_ok = True
+        except Exception:
+            redis_ok = False
+
+    supabase_ok = None
+    if SUPABASE_URL and SUPABASE_KEY and _http:
+        try:
+            r = await _supabase_request("GET", "/rest/v1/geo_zones", context="ready", params={"limit": "1", "select": "id"})
+            supabase_ok = r.is_success
+        except Exception:
+            supabase_ok = False
+
+    return JSONResponse({
+        "ok": True,
+        "instance": INSTANCE_ID,
+        "redis": redis_ok,
+        "supabase": supabase_ok,
+        "socketio": True,
+        "uptime_s": round(time.time() - _start_time),
+    })
+
+
+@app.get("/stats")
+async def stats() -> JSONResponse:
+    """Lightweight runtime stats for admin/debug dashboards."""
+    local_rooms = {room: len(sids) for room, sids in _local_rooms.items()}
+    return JSONResponse({
+        "instance": INSTANCE_ID,
+        "uptime_s": round(time.time() - _start_time),
+        "local_users": len(_local_users),
+        "local_rooms": local_rooms,
+        "quality_tasks": len(_quality),
+        "screen_shares": {room: _public_screen_state(state) for room, state in _local_screens.items()},
+        "rate_state_sizes": {
+            "voice": len(_local_msg_times),
+            "live": len(_local_chunk_times),
+            "signal": len(_local_signal_times),
+            "ai": len(_local_ai_times),
+        },
+        "redis_enabled": bool(_redis),
+        "supabase_enabled": bool(_http),
+    })
 
 
 @app.post("/ai/chat")
@@ -1302,7 +1567,7 @@ async def zones_ping() -> JSONResponse:
     if _http is None:
         return JSONResponse({"ok": False, "error": "not ready"}, status_code=503)
     try:
-        r = await _http.get("/rest/v1/geo_zones", params={"limit": "1", "select": "id"})
+        r = await _supabase_request("GET", "/rest/v1/geo_zones", context="zones_ping", params={"limit": "1", "select": "id"})
         return JSONResponse({"ok": r.is_success, "status": r.status_code, "body": r.text[:500]})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
@@ -1313,7 +1578,7 @@ async def get_zones(request: Request) -> JSONResponse:
     if _http is None:
         return JSONResponse({"error": "server initializing"}, status_code=503)
     try:
-        r = await _http.get("/rest/v1/geo_zones", params={
+        r = await _supabase_request("GET", "/rest/v1/geo_zones", context="get_zones", params={
             "order":      "created_at.asc",
             "select":     "id,device_id,name,channel,lat,lng,radius,color,auto_join,created_by,expires_at",
             "expires_at": "gte.now()",
@@ -1371,8 +1636,11 @@ async def upsert_zone(request: Request) -> JSONResponse:
     }
 
     try:
-        r = await _http.post(
-            "/rest/v1/geo_zones", json=payload,
+        r = await _supabase_request(
+            "POST",
+            "/rest/v1/geo_zones",
+            context="upsert_zone",
+            json=payload,
             headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
         )
         if not r.is_success:
@@ -1403,8 +1671,10 @@ async def delete_zone(zone_id: str, request: Request) -> JSONResponse:
     if _http is None:
         return JSONResponse({"error": "server initializing"}, status_code=503)
     try:
-        r = await _http.delete(
+        r = await _supabase_request(
+            "DELETE",
             "/rest/v1/geo_zones",
+            context="delete_zone",
             params={"id": f"eq.{zone_id}", "device_id": f"eq.{device_id}"},
             headers={"Prefer": "return=representation"},
         )
@@ -1532,9 +1802,9 @@ async def update_name(sid: str, data: dict) -> None:
         if info:
             info["name"] = new_name
         if not room and _redis:
-            room = await _redis.hget(_RK_USER + sid, "room")
+            room = await _redis_op("update_name_get_room", lambda: _redis.hget(_RK_USER + sid, "room"), default=None, attempts=1)
         if _redis and name_changed:
-            await _redis.hset(_RK_USER + sid, "name", new_name)
+            await _redis_op("update_name", lambda: _redis.hset(_RK_USER + sid, "name", new_name), default=None)
         if room:
             active_screen = await _get_screen_state(room)
             if active_screen and active_screen.get("sender_sid") == sid:
@@ -1644,26 +1914,24 @@ async def voice_message(sid: str, data: dict) -> None:
                 await sio.emit("status_update", {"msg": "AI URL not configured", "cls": "err"}, to=sid)
                 return
             try:
-                client = _ai_http or httpx.AsyncClient(timeout=AI_TIMEOUT_SECS)
-                close_client = _ai_http is None
-                try:
-                    resp = await client.post(
-                        AI_ASSISTANT_URL,
-                        json={
-                            # bot-voice /ai-assistant JSON mode expects audio_base64/audio_mime.
-                            "audio_base64": _strip_data_url_base64(audio),
-                            "audio_mime": mime,
-                            "message": "",
-                            "username": name,
-                            "room": room,
-                            "source": "walkietalk_voice_message",
-                        },
-                        headers=_ai_headers(),
-                        timeout=AI_TIMEOUT_SECS,
-                    )
-                finally:
-                    if close_client:
-                        await client.aclose()
+                if not AI_ASSISTANT_API_KEY:
+                    await sio.emit("status_update", {"msg": "AI API key missing", "cls": "err"}, to=sid)
+                    log.warning("AI voice request skipped: AI_ASSISTANT_API_KEY / AI_API_KEY is missing")
+                    return
+
+                resp = await _post_ai_json(
+                    AI_ASSISTANT_URL,
+                    {
+                        # bot-voice /ai-assistant JSON mode expects audio_base64/audio_mime.
+                        "audio_base64": _strip_data_url_base64(audio),
+                        "audio_mime": mime,
+                        "message": "",
+                        "username": name,
+                        "room": room,
+                        "source": "walkietalk_voice_message",
+                    },
+                    timeout=AI_TIMEOUT_SECS,
+                )
 
                 if not resp.is_success:
                     await sio.emit("status_update", {"msg": "AI server error", "cls": "err"}, to=sid)
@@ -2051,7 +2319,7 @@ async def msg_delivered(sid: str, data: dict) -> None:
         # Local check first; Redis hexists only if needed and redis is available
         exists = to in _local_users
         if not exists and _redis:
-            exists = bool(await _redis.hexists(_RK_PRESENCE, to))
+            exists = bool(await _redis_op("msg_delivered_presence", lambda: _redis.hexists(_RK_PRESENCE, to), default=False, attempts=1))
         if exists:
             await sio.emit("msg_delivered", {"msg_id": msg_id}, to=to)
     except Exception as exc:

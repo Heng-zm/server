@@ -9,6 +9,10 @@ Environment variables:
     ENABLE_SOCKETIO_REDIS = false by default; set true only for multi-instance Socket.IO pub/sub
     SOCKETIO_REDIS_URL    = optional Socket.IO pub/sub Redis URL; defaults to REDIS_URL when enabled
     REDIS_CIRCUIT_OPEN_SECS = seconds to pause Redis operations after repeated failures
+    MAPBOX_ACCESS_TOKEN  = public pk token for Mapbox GL JS, stored in backend env
+    MAPBOX_STANDARD_STYLE= mapbox://styles/mapbox/standard
+    MAPBOX_STANDARD_SATELLITE_STYLE = mapbox://styles/mapbox/standard-satellite
+    PUBLIC_CONFIG_CACHE_SECS = browser/cache max-age for /config/mapbox
     AI_ASSISTANT_URL      = https://bot-voice-sqnz.onrender.com/ai-assistant
     AI_CHAT_URL           = optional dedicated text-chat endpoint; empty = use AI_ASSISTANT_URL
     AI_ASSISTANT_API_KEY  = same value as AI_API_KEY on the bot-voice server
@@ -86,27 +90,62 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "y", "on", "enable", "enabled"}
 
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
-REDIS_URL    = os.environ.get("REDIS_URL", "").strip()
+def _env_str(name: str, default: str = "", *, max_len: int = 512) -> str:
+    """Read a stripped string from ENV with an optional hard length cap."""
+    value = os.environ.get(name, default)
+    if value is None:
+        return default
+    return str(value).strip()[:max_len]
+
+
+def _redact_url_for_log(url: str) -> str:
+    """Mask credentials in URLs before logging them."""
+    if not url:
+        return ""
+    # redis://user:password@host:port -> redis://user:***@host:port
+    return re.sub(r"(^[a-zA-Z][a-zA-Z0-9+.-]*://[^:/@]+:)[^@]+(@)", r"\1***\2", url)
+
+
+SUPABASE_URL = _env_str("SUPABASE_URL").rstrip("/")
+SUPABASE_KEY = _env_str("SUPABASE_KEY", max_len=4096)
+REDIS_URL    = _env_str("REDIS_URL", max_len=4096)
+
+# Mapbox public browser token is stored in backend ENV and served to the frontend
+# through /config/mapbox. This keeps the token out of source code. Because Mapbox
+# GL JS runs in the browser, the token is still visible to users at runtime; restrict
+# the token to your allowed website domains in the Mapbox dashboard.
+MAPBOX_ACCESS_TOKEN = (
+    _env_str("MAPBOX_ACCESS_TOKEN")
+    or _env_str("MAPBOX_TOKEN")
+)
+MAPBOX_STANDARD_STYLE = _env_str(
+    "MAPBOX_STANDARD_STYLE",
+    "mapbox://styles/mapbox/standard",
+)
+MAPBOX_STANDARD_SATELLITE_STYLE = _env_str(
+    "MAPBOX_STANDARD_SATELLITE_STYLE",
+    "mapbox://styles/mapbox/standard-satellite",
+)
+PUBLIC_CONFIG_CACHE_SECS = _env_int("PUBLIC_CONFIG_CACHE_SECS", 300, 0, 86400)
+
 # IMPORTANT: python-socketio's AsyncRedisManager runs a permanent Redis pub/sub
 # listener. When Redis is unstable it logs "Cannot receive from redis..." every
 # second. Keep it disabled for one-worker deployments. Your app-level Redis state
 # below still works and has graceful local fallback. Enable only when you truly run
 # multiple server instances that must share Socket.IO room events.
 ENABLE_SOCKETIO_REDIS = _env_bool("ENABLE_SOCKETIO_REDIS", False)
-SOCKETIO_REDIS_URL = (os.environ.get("SOCKETIO_REDIS_URL") or REDIS_URL).strip()
-SOCKETIO_REDIS_CHANNEL = os.environ.get("SOCKETIO_REDIS_CHANNEL", "walkie_sio").strip() or "walkie_sio"
-AI_ASSISTANT_URL = os.environ.get("AI_ASSISTANT_URL",
-    "https://bot-voice-sqnz.onrender.com/ai-assistant")
+SOCKETIO_REDIS_URL = (_env_str("SOCKETIO_REDIS_URL", max_len=4096) or REDIS_URL).strip()
+SOCKETIO_REDIS_CHANNEL = _env_str("SOCKETIO_REDIS_CHANNEL", "walkie_sio", max_len=128) or "walkie_sio"
+AI_ASSISTANT_URL = _env_str("AI_ASSISTANT_URL",
+    "https://bot-voice-sqnz.onrender.com/ai-assistant", max_len=2048)
 # Optional text chat endpoint. If empty, the server will try AI_ASSISTANT_URL
 # with a text payload and return a clear setup message if the backend does not support it.
-AI_CHAT_URL = os.environ.get("AI_CHAT_URL", "").strip()
+AI_CHAT_URL = _env_str("AI_CHAT_URL", max_len=2048)
 # Send this key to bot-voice /ai-assistant. It must match AI_API_KEY on that server.
 # Keep AI_CHAT_URL empty when /ai-assistant supports text JSON {"message": "..."}.
 AI_ASSISTANT_API_KEY = (
-    os.environ.get("AI_ASSISTANT_API_KEY")
-    or os.environ.get("AI_API_KEY")
+    _env_str("AI_ASSISTANT_API_KEY", max_len=4096)
+    or _env_str("AI_API_KEY", max_len=4096)
     or ""
 ).strip()
 AI_TIMEOUT_SECS = _env_float("AI_TIMEOUT_SECS", 45.0, 5.0, 120.0)
@@ -653,7 +692,7 @@ async def _lifespan(app: FastAPI):
                 health_check_interval=30,
             )
             await _redis.ping()
-            log.info("Redis connected  url=%s  instance=%s", REDIS_URL[:40], INSTANCE_ID)
+            log.info("Redis connected  url=%s  instance=%s", _redact_url_for_log(REDIS_URL), INSTANCE_ID)
         except Exception as exc:
             log.warning("Redis unavailable (%s) — single-instance mode", exc)
             _redis = None
@@ -1505,6 +1544,7 @@ async def root() -> JSONResponse:
         "stats": "/stats",
         "zones": "/zones",
         "ai_chat": "/ai/chat",
+        "mapbox_config": "/config/mapbox",
         "socketio_path": "/socket.io",
         "features": {
             "voice_relay": True,
@@ -1518,6 +1558,7 @@ async def root() -> JSONResponse:
             "redis_circuit_breaker": True,
             "socketio_redis_pubsub": bool(ENABLE_SOCKETIO_REDIS and SOCKETIO_REDIS_URL),
             "runtime_stats": True,
+            "mapbox_env_config": bool(MAPBOX_ACCESS_TOKEN),
         },
         "screen_share_events": [
             "screen_share_start", "screen_share_stop", "screen_share_state",
@@ -1551,6 +1592,7 @@ async def health() -> JSONResponse:
         "supabase_configured": bool(SUPABASE_URL and SUPABASE_KEY),
         "ai_configured": bool(AI_CHAT_URL or AI_ASSISTANT_URL),
         "ai_key_configured": bool(AI_ASSISTANT_API_KEY),
+        "mapbox_configured": bool(MAPBOX_ACCESS_TOKEN),
         "uptime_s":    round(now - _start_time),
     })
 
@@ -1575,6 +1617,7 @@ async def ready() -> JSONResponse:
         "instance": INSTANCE_ID,
         "redis": redis_ok,
         "supabase": supabase_ok,
+        "mapbox": bool(MAPBOX_ACCESS_TOKEN),
         "socketio": True,
         "uptime_s": round(time.time() - _start_time),
     })
@@ -1602,7 +1645,50 @@ async def stats() -> JSONResponse:
         "redis_consecutive_failures": _redis_consecutive_failures,
         "socketio_redis_pubsub": bool(ENABLE_SOCKETIO_REDIS and SOCKETIO_REDIS_URL),
         "supabase_enabled": bool(_http),
+        "mapbox_enabled": bool(MAPBOX_ACCESS_TOKEN),
     })
+
+
+@app.get("/config/mapbox")
+async def mapbox_config() -> JSONResponse:
+    """Return public Mapbox browser config from backend ENV.
+
+    This endpoint intentionally returns a public Mapbox pk token for Mapbox GL JS.
+    Do not store or return secret sk tokens here.
+    """
+    if not MAPBOX_ACCESS_TOKEN:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "MAPBOX_ACCESS_TOKEN is not configured on backend server ENV",
+            },
+            status_code=503,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    if MAPBOX_ACCESS_TOKEN.startswith("sk."):
+        log.error("MAPBOX_ACCESS_TOKEN appears to be a secret token. Use a public pk token for browsers.")
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "Invalid Mapbox token type for browser. Use a public pk token, not a secret sk token.",
+            },
+            status_code=500,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "token": MAPBOX_ACCESS_TOKEN,
+            "styles": {
+                "standard": MAPBOX_STANDARD_STYLE,
+                "standard_satellite": MAPBOX_STANDARD_SATELLITE_STYLE,
+            },
+            "default_style": "standard",
+        },
+        headers={"Cache-Control": f"public, max-age={PUBLIC_CONFIG_CACHE_SECS}"},
+    )
 
 
 @app.post("/ai/chat")
